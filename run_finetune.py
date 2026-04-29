@@ -27,7 +27,7 @@ IMG_SIZE          = [912, 1520]
 
 
 DEVICE            = "cuda"    
-NUM_WORKERS       = 0         
+NUM_WORKERS       = 4         
 APEX              = "y"       
 GPU_ID            = 0         # 使用的GPU编号
 
