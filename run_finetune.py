@@ -1,59 +1,40 @@
-"""
-一键微调脚本：自动完成数据预处理 → 5折训练 → 测试集预测 → Ensemble输出
-
-使用方法:
-    修改下方配置区域的变量后直接运行即可：
-    python run_finetune.py
-
-数据目录结构要求:
-    /mnt/g/data/
-    ├── train_with_test_data_mini.csv   (原始CSV文件)
-    ├── images_png\                     (图片目录)
-    │   ├── 10006\                      (patient_id)
-    │   │   ├── 462822612.png           (image_id.png)
-    │   │   └── ...
-    │   ├── 10011\
-    │   └── ...
-    └── ...
-"""
 
 # =============================================================================
-# ========================= 配置区域（按需修改） ==============================
+# ========================= 配置区域 ==============================
 # =============================================================================
 
-# ---- 路径 ----
-CSV_PATH          = r"/mnt/g/data/train_with_test_data_mini.csv"  # 原始CSV文件路径
-DATA_DIR          = r"/mnt/g/data"                                 # 数据根目录
-IMG_DIR           = "images_png"                                   # 图片目录（相对于 DATA_DIR，也可用绝对路径）
+
+CSV_PATH          = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images/embed_data_testcohort_enriched.csv"    # 原始CSV文件路径
+DATA_DIR          = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"                                 # 数据根目录
+IMG_DIR           = "images_png"                                   # 图片目录
 CLIP_CHK_PT_PATH  = "./model/b5-model-best-epoch-7.tar"          # Mammo-CLIP预训练权重路径
 
-# ---- 数据集 / 任务 ----
-LABEL             = "cancer"                          # CSV中的标签列名
-ARCH              = "breast_clip_det_b5_period_n_ft"  # 模型架构: "breast_clip_det_b5_period_n_ft"=全量微调, "breast_clip_det_b5_period_n_lp"=线性探针
 
-# ---- 训练 ----
+LABEL             = "cancer"                         
+ARCH              = "breast_clip_det_b5_period_n_ft"  
+
+
 N_FOLDS           = 5         # 交叉验证折数
-EPOCHS            = 5         # 每折最大训练轮数
-PATIENCE          = 10        # 早停耐心值（0=禁用）
-BATCH_SIZE        = 2         # 批大小
-LR                = 5e-5      # 学习率
-SEED              = 42        # 随机种子
-WEIGHTED_BCE      = "y"       # 是否使用加权BCE ("y"/"n")
+EPOCHS            = 25         # 每折最大训练轮数
+PATIENCE          = 5        # 早停
+BATCH_SIZE        = 16         
+LR                = 5e-5      
+SEED              = 42       
+WEIGHTED_BCE      = "y"       
 
-# ---- 图片 ----
-IMG_SIZE          = [912, 1520]  # 图片尺寸 [宽, 高]
 
-# ---- 系统 ----
-DEVICE            = "cuda"    # 设备 ("cuda" 或 "cpu")
-NUM_WORKERS       = 0         # 数据加载线程数
-APEX              = "y"       # 混合精度 ("y"/"n")
+IMG_SIZE          = [912, 1520]  
 
-# ---- 流程控制 ----
-SKIP_PREPARE      = False     # 是否跳过折划分准备（已准备好时设为 True）
 
-# =============================================================================
-# =========================== 运行（无需修改） ===============================
-# =============================================================================
+DEVICE            = "cuda"    
+NUM_WORKERS       = 0         
+APEX              = "y"       
+GPU_ID            = 0         # 使用的GPU编号
+
+
+SKIP_PREPARE      = False    
+
+
 
 import os
 import subprocess
@@ -61,7 +42,7 @@ import sys
 
 
 def ensure_nltk_punkt():
-    """确保 NLTK punkt tokenizer 数据已下载，避免训练时重复下载或网络超时"""
+
     import nltk
     try:
         nltk.data.find("tokenizers/punkt")
@@ -80,24 +61,26 @@ def ensure_nltk_punkt():
 
 
 def main():
-    # ===================== Step 0: 检查 NLTK punkt =====================
+
     ensure_nltk_punkt()
 
-    # 获取脚本所在目录（项目根目录）
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
+    print(f"[GPU] Using GPU {GPU_ID} (CUDA_VISIBLE_DEVICES={GPU_ID})")
+
     project_root = os.path.dirname(os.path.abspath(__file__))
     scripts_dir = os.path.join(project_root, "src", "scripts")
     codebase_dir = os.path.join(project_root, "src", "codebase")
 
-    # 将相对路径转换为绝对路径，避免 subprocess cwd 变化导致路径失效
+
     clip_chk_pt_path = CLIP_CHK_PT_PATH
     if not os.path.isabs(clip_chk_pt_path):
         clip_chk_pt_path = os.path.abspath(clip_chk_pt_path)
 
-    # 生成的 folds CSV 路径
+
     folds_csv_path = os.path.join(DATA_DIR, "train_with_test_folds.csv")
     csv_filename = "train_with_test_folds.csv"
 
-    # ===================== Step 1: 准备折划分 =====================
+
     if not SKIP_PREPARE:
         print("\n" + "=" * 60)
         print("Step 1: Preparing 5-fold stratified split...")
@@ -119,7 +102,7 @@ def main():
     else:
         print(f"Skipping fold preparation. Using existing: {folds_csv_path}")
 
-    # ===================== Step 2: 训练分类器 =====================
+
     print("\n" + "=" * 60)
     print("Step 2: Training classifier with 5-fold CV...")
     print("=" * 60)
