@@ -48,7 +48,7 @@ ARCH               = "breast_clip_det_b5_period_n_ft"
 N_FOLDS            = 5
 EPOCHS             = 25
 PATIENCE           = 3
-BATCH_SIZE         = 32
+BATCH_SIZE         = 12
 LR                 = 5e-5
 SEED               = 42
 WEIGHTED_BCE       = "y"       # 对EDL逐样本loss启用类别不平衡加权
@@ -60,7 +60,7 @@ IMG_SIZE           = [912, 1520]
 DEVICE             = "cuda"
 NUM_WORKERS        = 4
 APEX               = "y"
-GPU_ID             = 0
+GPU_ID             = 2
 
 # ---------- 是否跳过数据准备 ----------
 SKIP_PREPARE       = False
@@ -149,8 +149,8 @@ def main():
     if not os.path.isabs(clip_chk_pt_path):
         clip_chk_pt_path = os.path.abspath(clip_chk_pt_path)
 
-    folds_csv_path = os.path.join(DATA_DIR, "train_with_test_folds.csv")
-    csv_filename = "train_with_test_folds.csv"
+    folds_csv_path = os.path.join(project_root, "train_with_test_folds.csv")
+    csv_filename = folds_csv_path
 
     # ===================== Step 1: 准备五折划分 =====================
     if not SKIP_PREPARE:

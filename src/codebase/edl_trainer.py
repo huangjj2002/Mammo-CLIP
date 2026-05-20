@@ -105,7 +105,10 @@ def do_edl_experiments(args, device):
     """
     args.model_base_name = args.arch
     args.data_dir = Path(args.data_dir)
-    args.df = pd.read_csv(args.data_dir / args.csv_file)
+    csv_path = Path(args.csv_file)
+    if not csv_path.is_absolute():
+        csv_path = args.data_dir / csv_path
+    args.df = pd.read_csv(csv_path)
     args.df = args.df.fillna(0)
     print(f"df shape: {args.df.shape}")
     print(args.df.columns)
