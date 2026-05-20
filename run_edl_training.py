@@ -32,10 +32,9 @@ Mammo-CLIP + Evidential Deep Learning (EDL) 微调脚本
 # =============================================================================
 
 # ---------- 数据路径 ----------
-#CSV_PATH           = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images/embed_data_testcohort_enriched.csv"
-#DATA_DIR           = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"
-CSV_PATH           = r"/mnt/g/data/train_with_test_data_mini.csv"
-DATA_DIR           = r"/mnt/g/data"
+CSV_PATH           = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images/embed_data_testcohort_enriched.csv"
+DATA_DIR           = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"
+
 IMG_DIR            = "images_png"
 CLIP_CHK_PT_PATH   = "./model/b5-model-best-epoch-7.tar"
 MODEL_SAVE_DIR     = "best_model"
@@ -48,8 +47,8 @@ ARCH               = "breast_clip_det_b5_period_n_ft"
 # ---------- 交叉验证 ----------
 N_FOLDS            = 5
 EPOCHS             = 25
-PATIENCE           = 5
-BATCH_SIZE         = 16
+PATIENCE           = 3
+BATCH_SIZE         = 32
 LR                 = 5e-5
 SEED               = 42
 WEIGHTED_BCE       = "y"       # 对EDL逐样本loss启用类别不平衡加权
