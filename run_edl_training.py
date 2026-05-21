@@ -27,6 +27,8 @@ Mammo-CLIP + Evidential Deep Learning (EDL) 微调脚本
     - 所有EDL相关代码位于 src/codebase/edl_*.py
 """
 
+SKIP_BAD_BATCHES   = True
+
 # =============================================================================
 # ========================= 配置区域 ==============================
 # =============================================================================
@@ -46,9 +48,9 @@ ARCH               = "breast_clip_det_b5_period_n_ft"
 
 # ---------- 交叉验证 ----------
 N_FOLDS            = 5
-EPOCHS             = 25
+EPOCHS             = 10
 PATIENCE           = 3
-BATCH_SIZE         = 12
+BATCH_SIZE         = 8
 LR                 = 5e-5
 SEED               = 42
 WEIGHTED_BCE       = "y"       # 对EDL逐样本loss启用类别不平衡加权
@@ -60,7 +62,7 @@ IMG_SIZE           = [912, 1520]
 DEVICE             = "cuda"
 NUM_WORKERS        = 4
 APEX               = "y"
-GPU_ID             = 2
+GPU_ID             = 1
 
 # ---------- 是否跳过数据准备 ----------
 SKIP_PREPARE       = False
@@ -69,13 +71,14 @@ SKIP_PREPARE       = False
 # full: train image encoder + EDL head
 # head_only: freeze image encoder and train only the EDL head
 TRAIN_MODE         = "full"
+RESUME_TRAINING    = False
 
 # ---------- EDL专属参数 ----------
 EDL_LOSS_TYPE      = "digamma"     # 损失函数类型: 'digamma'(推荐), 'log', 'mse'
 EDL_NUM_CLASSES    = 2             # 类别数（二分类=2，EDL需要为每个类别输出evidence）
 EDL_KL_WEIGHT      = 0.1           # KL正则项权重，对齐参考MIL项目
 EDL_ANNEALING_START = 0            # KL退火开始epoch
-EDL_ANNEALING_EPOCHS = 10          # KL退火到1.0所需epoch数
+EDL_ANNEALING_EPOCHS = 5          # KL退火到1.0所需epoch数
 EDL_DROPOUT        = 0.0           # EDL分类头Dropout
 EDL_HIDDEN_DIM     = None          # EDL分类头隐藏层维度（None=直接线性映射）
 
@@ -132,6 +135,25 @@ def main():
         "--csv-save-dir",
         default=CSV_SAVE_DIR,
         help="Directory under the project root for saving prediction CSVs and loss curves.",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        default=RESUME_TRAINING,
+        help="Resume EDL training from the latest per-fold checkpoint when available.",
+    )
+    parser.add_argument(
+        "--skip-bad-batches",
+        dest="skip_bad_batches",
+        action="store_true",
+        default=SKIP_BAD_BATCHES,
+        help="Skip bad/fallback samples and recoverable non-finite batches instead of aborting training.",
+    )
+    parser.add_argument(
+        "--no-skip-bad-batches",
+        dest="skip_bad_batches",
+        action="store_false",
+        help="Disable bad-batch skipping and fail fast on malformed batches.",
     )
     cli_args = parser.parse_args()
 
@@ -243,6 +265,8 @@ def main():
     args.balanced_dataloader = "n"
     args.train_mode = cli_args.train_mode
     args.freeze_backbone = "y" if args.train_mode == "head_only" else "n"
+    args.resume = cli_args.resume
+    args.skip_bad_batches = cli_args.skip_bad_batches
 
     # EDL专属参数
     args.num_classes = EDL_NUM_CLASSES
@@ -287,6 +311,8 @@ def main():
     print(f"edl_hidden_dim: {args.edl_hidden_dim}")
     print(f"train_mode: {args.train_mode}")
     print(f"freeze_backbone: {args.freeze_backbone}")
+    print(f"resume: {args.resume}")
+    print(f"skip_bad_batches: {args.skip_bad_batches}")
     device = DEVICE if DEVICE != "cuda" else ('cuda' if torch.cuda.is_available() else 'cpu')
     args.apex = args.apex and str(device).startswith("cuda")
 

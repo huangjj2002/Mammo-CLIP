@@ -11,6 +11,66 @@ from imgaug.augmentables.bbs import BoundingBox, BoundingBoxesOnImage
 from torch.utils.data import Dataset
 
 
+def _normalize_image_array(img, img_path):
+    if img is None:
+        raise FileNotFoundError(f"Failed to read image: {img_path}")
+
+    img = np.asarray(img, dtype=np.float32)
+    if img.size == 0:
+        raise ValueError(f"Empty image array: {img_path}")
+
+    img -= img.min()
+    img_max = float(img.max())
+
+    if not np.isfinite(img_max) or img_max <= 0.0:
+        print(f"[WARN] zero dynamic range image encountered, replacing with zeros: {img_path}")
+        img = np.zeros_like(img, dtype=np.float32)
+    else:
+        img /= img_max
+
+    return np.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def _normalize_image_tensor(img, img_path):
+    if img is None:
+        raise FileNotFoundError(f"Failed to read image: {img_path}")
+
+    img = img.to(torch.float32)
+    if img.numel() == 0:
+        raise ValueError(f"Empty image tensor: {img_path}")
+
+    img -= img.min()
+    img_max = float(img.max().item())
+
+    if not np.isfinite(img_max) or img_max <= 0.0:
+        print(f"[WARN] zero dynamic range image encountered, replacing with zeros: {img_path}")
+        img = torch.zeros_like(img, dtype=torch.float32)
+    else:
+        img = img / img_max
+
+    return torch.nan_to_num(img, nan=0.0, posinf=1.0, neginf=0.0)
+
+
+def _is_detector_arch(args):
+    return args.arch.lower() in {
+        "breast_clip_det_b5_period_n_ft",
+        "breast_clip_det_b5_period_n_lp",
+        "breast_clip_det_b2_period_n_ft",
+        "breast_clip_det_b2_period_n_lp",
+    }
+
+
+def _build_fallback_tensor(args):
+    width = int(args.img_size[0])
+    height = int(args.img_size[1])
+    if _is_detector_arch(args):
+        img = np.zeros((height, width, 3), dtype=np.float32)
+    else:
+        img = np.zeros((height, width), dtype=np.float32)
+    img = (img - args.mean) / args.std
+    return torch.tensor(img, dtype=torch.float32)
+
+
 class MammoDataset(Dataset):
 
     def __init__(self, args, df, transform=None):
@@ -38,40 +98,40 @@ class MammoDataset(Dataset):
         if not img_path.exists() and not image_id.endswith('.png'):
             img_path = self.dir_path / patient_id / f'{image_id}.png'
 
-        if (
-                self.args.arch.lower() == "breast_clip_det_b5_period_n_ft" or
-                self.args.arch.lower() == "breast_clip_det_b5_period_n_lp" or
-                self.args.arch.lower() == "breast_clip_det_b2_period_n_ft" or
-                self.args.arch.lower() == "breast_clip_det_b2_period_n_lp"
-        ):
-            img = Image.open(str(img_path)).convert('RGB')
-        else:
-            img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
+        try:
+            if _is_detector_arch(self.args):
+                img = Image.open(str(img_path)).convert('RGB')
+            else:
+                img = cv2.imread(str(img_path), cv2.IMREAD_GRAYSCALE)
 
-        if self.transform and (
-                self.args.arch.lower() == "swin_tiny_custom_norm" or
-                self.args.arch.lower() == "swin_base_custom_norm"):
-            img = self.transform(img)
-        elif self.transform:
-            img = np.array(img)
-            augmented = self.transform(image=img)
-            img = augmented['image']
+            if self.transform and (
+                    self.args.arch.lower() == "swin_tiny_custom_norm" or
+                    self.args.arch.lower() == "swin_base_custom_norm"):
+                img = self.transform(img)
+            elif self.transform:
+                img = np.array(img)
+                augmented = self.transform(image=img)
+                img = augmented['image']
+                img = _normalize_image_array(img, img_path)
+                img = torch.tensor((img - self.args.mean) / self.args.std, dtype=torch.float32)
+            else:
+                img = _normalize_image_array(img, img_path)
+                img = torch.tensor((img - self.args.mean) / self.args.std, dtype=torch.float32)
 
-            img = img.astype('float32')
-            img -= img.min()
-            img /= img.max()
-            img = torch.tensor((img - self.args.mean) / self.args.std, dtype=torch.float32)
-        else:
-            img = np.array(img)
-            img = img.astype('float32')
-            img -= img.min()
-            img /= img.max()
-            img = torch.tensor((img - self.args.mean) / self.args.std, dtype=torch.float32)
+            is_fallback = False
+            error = ""
+        except Exception as exc:
+            print(f"[WARN] fallback image used for {img_path}: {exc}")
+            img = _build_fallback_tensor(self.args)
+            is_fallback = True
+            error = str(exc)
 
         return {
             'x': img.unsqueeze(0),
             'y': torch.tensor(data[self.label], dtype=torch.long),
-            'img_path': str(img_path)
+            'img_path': str(img_path),
+            'is_fallback': is_fallback,
+            'error': error,
         }
 
 
@@ -79,7 +139,9 @@ def collator_mammo_dataset_w_concepts(batch):
     return {
         'x': torch.stack([item['x'] for item in batch]),
         'y': torch.from_numpy(np.array([item["y"] for item in batch], dtype=np.float32)),
-        'img_path': [item['img_path'] for item in batch]
+        'img_path': [item['img_path'] for item in batch],
+        'is_fallback': [bool(item.get('is_fallback', False)) for item in batch],
+        'error': [item.get('error', '') for item in batch],
     }
 
 
@@ -168,10 +230,7 @@ class MammoDataset_concept_detection(Dataset):
             )
         if self.transform:
             image = self.transform(image)
-        image = image.to(torch.float32)
-
-        image -= image.min()
-        image /= image.max()
+        image = _normalize_image_tensor(image, path)
         image = torch.tensor((image - self.mean) / self.std, dtype=torch.float32)
         bb_final = []
         for idx, bb in enumerate(boxes[0]):
@@ -242,9 +301,7 @@ class MammoDataset_concept(Dataset):
         if self.transform:
             augmented = self.transform(image=img)
             img = augmented['image']
-        img = img.astype('float32')
-        img -= img.min()
-        img /= img.max()
+        img = _normalize_image_array(img, img_path)
         img = torch.tensor((img - self.args.mean) / self.args.std, dtype=torch.float32)
 
         y = None

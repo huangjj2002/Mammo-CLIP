@@ -48,6 +48,142 @@ def _empty_cuda_cache(device):
         torch.cuda.empty_cache()
 
 
+def _assert_finite_tensor(name, tensor, img_paths=None):
+    if torch.isfinite(tensor).all():
+        return
+
+    message = f"Non-finite values detected in {name}."
+    if img_paths:
+        preview = ", ".join(str(path) for path in img_paths[:4])
+        message += f" Example img_path(s): {preview}"
+    raise ValueError(message)
+
+
+def _fold_best_model_path(args):
+    model_name = f'edl_{args.model_base_name}_seed_{args.seed}_fold{args.cur_fold}_best_aucroc.pth'
+    return args.chk_pt_path / model_name
+
+
+def _fold_last_checkpoint_path(args):
+    model_name = f'edl_{args.model_base_name}_seed_{args.seed}_fold{args.cur_fold}_last.pth'
+    return args.chk_pt_path / model_name
+
+
+def _skip_log_path(args):
+    return args.output_path / f'edl_fold{args.cur_fold}_skipped_batches.log'
+
+
+def _append_skip_log(args, stage, epoch, step, img_paths, reason):
+    if not img_paths:
+        return
+
+    log_path = _skip_log_path(args)
+    with log_path.open("a", encoding="utf-8") as fp:
+        for img_path in img_paths:
+            fp.write(
+                f"stage={stage}\tepoch={epoch + 1}\tstep={step}\timg_path={img_path}\treason={reason}\n"
+            )
+
+
+def _is_recoverable_batch_error(exc):
+    recoverable_markers = (
+        "Failed to read image",
+        "Empty image",
+        "Non-finite values detected",
+        "Non-finite train loss detected",
+        "Non-finite valid loss detected",
+        "zero dynamic range image",
+    )
+    text = str(exc)
+    return any(marker in text for marker in recoverable_markers)
+
+
+def _filter_valid_subbatch(data):
+    fallback_flags = data.get("is_fallback", [])
+    if not fallback_flags:
+        return data, [], []
+
+    valid_indices = [idx for idx, is_fallback in enumerate(fallback_flags) if not is_fallback]
+    bad_paths = [data["img_path"][idx] for idx, is_fallback in enumerate(fallback_flags) if is_fallback]
+    bad_errors = [data.get("error", [""] * len(fallback_flags))[idx] for idx, is_fallback in enumerate(fallback_flags) if is_fallback]
+
+    if len(valid_indices) == len(fallback_flags):
+        return data, [], []
+
+    filtered = {
+        "x": data["x"][valid_indices],
+        "y": data["y"][valid_indices],
+        "img_path": [data["img_path"][idx] for idx in valid_indices],
+        "is_fallback": [data["is_fallback"][idx] for idx in valid_indices],
+        "error": [data.get("error", [""] * len(fallback_flags))[idx] for idx in valid_indices],
+    }
+    return filtered, bad_paths, bad_errors
+
+
+def _valid_indices_from_fallback_flags(fallback_flags, batch_size):
+    if fallback_flags:
+        return [idx for idx, is_fallback in enumerate(fallback_flags) if not is_fallback]
+    return list(range(batch_size))
+
+
+def _placeholder_prediction_batch(args, batch_size):
+    evidence = np.zeros((batch_size, args.num_classes), dtype=np.float32)
+    probs = np.full((batch_size, args.num_classes), 1.0 / float(args.num_classes), dtype=np.float32)
+    uncertainty = np.ones((batch_size, 1), dtype=np.float32)
+    return evidence, probs, uncertainty
+
+
+def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler):
+    start_epoch = 0
+    best_aucroc = 0.0
+    epochs_no_improve = 0
+    history = {
+        "epochs": [],
+        "train_loss": [],
+        "valid_loss": [],
+        "valid_aucroc": [],
+    }
+
+    last_ckpt_path = _fold_last_checkpoint_path(args)
+    if not getattr(args, "resume", False) or not last_ckpt_path.exists():
+        return start_epoch, best_aucroc, epochs_no_improve, history
+
+    ckpt = torch.load(last_ckpt_path, map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model"])
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    scaler_state = ckpt.get("scaler")
+    if scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
+
+    start_epoch = int(ckpt.get("epoch", -1)) + 1
+    best_aucroc = float(ckpt.get("best_aucroc", 0.0))
+    epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
+    history = ckpt.get("history", history)
+
+    print(
+        f"Resumed fold {args.cur_fold} from {last_ckpt_path} "
+        f"(next_epoch={start_epoch + 1}, best_aucroc={best_aucroc:.4f})"
+    )
+    return start_epoch, best_aucroc, epochs_no_improve, history
+
+
+def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best_aucroc, epochs_no_improve, history):
+    checkpoint = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+        "epoch": epoch,
+        "best_aucroc": best_aucroc,
+        "epochs_no_improve": epochs_no_improve,
+        "history": history,
+        "train_mode": getattr(args, "train_mode", "full"),
+        "freeze_backbone": getattr(args, "freeze_backbone", "n"),
+    }
+    torch.save(checkpoint, _fold_last_checkpoint_path(args))
+
+
 def _compute_fold_class_weights(args):
     if str(getattr(args, "weighted_BCE", "n")).lower() != "y":
         return None
@@ -260,6 +396,7 @@ def edl_train_loop(args, device):
         'total_steps': len(train_loader) * args.epochs
     }
     scheduler = LinearWarmupCosineAnnealingLR(optimizer, **lr_config)
+    scaler = torch.cuda.amp.GradScaler(enabled=_amp_enabled(args, device))
 
     # TensorBoard
     logger = SummaryWriter(args.tb_logs_path / f'edl_fold{args.cur_fold}')
@@ -276,16 +413,11 @@ def edl_train_loop(args, device):
         class_weights=class_weights,
     )
 
-    best_aucroc = 0.
-    epochs_no_improve = 0
-    history = {
-        "epochs": [],
-        "train_loss": [],
-        "valid_loss": [],
-        "valid_aucroc": [],
-    }
+    start_epoch, best_aucroc, epochs_no_improve, history = _load_last_checkpoint_if_available(
+        args, model, optimizer, scheduler, scaler
+    )
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
 
         # 更新损失函数中的epoch（用于KL退火）
@@ -293,7 +425,7 @@ def edl_train_loop(args, device):
 
         # 训练
         avg_loss = edl_train_fn(
-            train_loader, model, criterion, optimizer, epoch, args, scheduler, logger, device
+            train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, logger, device
         )
 
         # 验证
@@ -325,20 +457,29 @@ def edl_train_loop(args, device):
         if epoch == 0 or best_aucroc < aucroc_val:
             best_aucroc = aucroc_val
             epochs_no_improve = 0
-            model_name = f'edl_{args.model_base_name}_seed_{args.seed}_fold{args.cur_fold}_best_aucroc.pth'
             print(f'Epoch {epoch + 1} - Save Best AUC-ROC: {best_aucroc:.4f} Model')
             torch.save(
                 {
                     'model': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'scaler': scaler.state_dict() if scaler.is_enabled() else None,
                     'predictions': predictions,
                     'epoch': epoch,
                     'auroc': aucroc_val,
+                    'best_aucroc': best_aucroc,
+                    'epochs_no_improve': epochs_no_improve,
+                    'history': history,
                     'train_mode': getattr(args, "train_mode", "full"),
                     'freeze_backbone': getattr(args, "freeze_backbone", "n"),
-                }, args.chk_pt_path / model_name
+                }, _fold_best_model_path(args)
             )
         else:
             epochs_no_improve += 1
+
+        _save_last_checkpoint(
+            args, model, optimizer, scheduler, scaler, epoch, best_aucroc, epochs_no_improve, history
+        )
 
         # 早停
         if args.patience > 0 and epochs_no_improve >= args.patience:
@@ -349,8 +490,7 @@ def edl_train_loop(args, device):
         print(f'[Fold{args.cur_fold}], Best AUC-ROC: {best_aucroc:.4f}')
 
     # 加载最佳模型的预测结果
-    model_name = f'edl_{args.model_base_name}_seed_{args.seed}_fold{args.cur_fold}_best_aucroc.pth'
-    best_model_path = args.chk_pt_path / model_name
+    best_model_path = _fold_best_model_path(args)
     if best_model_path.exists():
         predictions = torch.load(best_model_path, map_location='cpu', weights_only=False)['predictions']
         args.valid_folds['prediction_prob'] = predictions
@@ -408,27 +548,59 @@ def edl_predict_on_dataset(args, df, model_path, device, fold):
     amp_enabled = _amp_enabled(args, device)
 
     with torch.no_grad():
-        for data in tqdm(predict_loader, desc=f"EDL Predicting fold{fold}"):
-            inputs = data['x'].to(device)
-            if (
-                args.arch.lower() == "breast_clip_det_b5_period_n_ft" or
-                args.arch.lower() == "breast_clip_det_b5_period_n_lp" or
-                args.arch.lower() == "breast_clip_det_b2_period_n_ft" or
-                args.arch.lower() == "breast_clip_det_b2_period_n_lp"
-            ):
-                inputs = inputs.squeeze(1).permute(0, 3, 1, 2)
+        for step, data in tqdm(enumerate(predict_loader), desc=f"EDL Predicting fold{fold}", total=len(predict_loader)):
+            batch_size = len(data.get("img_path", []))
+            fallback_flags = list(data.get("is_fallback", []))
+            valid_indices = _valid_indices_from_fallback_flags(fallback_flags, batch_size)
+            batch_evidence, batch_probs, batch_uncertainty = _placeholder_prediction_batch(args, batch_size)
+            try:
+                data, fallback_paths, fallback_errors = _filter_valid_subbatch(data)
+                if fallback_paths:
+                    reason = fallback_errors[0] if fallback_errors else "fallback image used during prediction"
+                    _append_skip_log(args, "predict_fallback", 0, step, fallback_paths, reason)
+                    if data["x"].size(0) == 0:
+                        all_evidence.append(batch_evidence)
+                        all_probs.append(batch_probs)
+                        all_uncertainty.append(batch_uncertainty)
+                        print(f"[WARN] Prediction batch contains only fallback images at step {step}: {reason}")
+                        continue
 
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
-                evidence = model(inputs)
+                inputs = data['x'].to(device)
+                if (
+                    args.arch.lower() == "breast_clip_det_b5_period_n_ft" or
+                    args.arch.lower() == "breast_clip_det_b5_period_n_lp" or
+                    args.arch.lower() == "breast_clip_det_b2_period_n_ft" or
+                    args.arch.lower() == "breast_clip_det_b2_period_n_lp"
+                ):
+                    inputs = inputs.squeeze(1).permute(0, 3, 1, 2)
 
+                _assert_finite_tensor("prediction inputs", inputs, data.get('img_path'))
+
+                with torch.cuda.amp.autocast(enabled=amp_enabled):
+                    evidence = model(inputs)
+                _assert_finite_tensor("prediction evidence", evidence, data.get('img_path'))
+                
             # 计算Dirichlet参数
-            alpha = BreastClipEDLClassifier.compute_dirichlet_params(evidence)
-            probs = BreastClipEDLClassifier.compute_probabilities(evidence)
-            uncertainty = BreastClipEDLClassifier.compute_uncertainty(evidence)
+                probs = BreastClipEDLClassifier.compute_probabilities(evidence)
+                uncertainty = BreastClipEDLClassifier.compute_uncertainty(evidence)
+                _assert_finite_tensor("prediction probabilities", probs, data.get('img_path'))
+                _assert_finite_tensor("prediction uncertainty", uncertainty, data.get('img_path'))
 
-            all_evidence.append(evidence.cpu().numpy())
-            all_probs.append(probs.cpu().numpy())
-            all_uncertainty.append(uncertainty.cpu().numpy())
+                batch_evidence[valid_indices] = evidence.cpu().numpy()
+                batch_probs[valid_indices] = probs.cpu().numpy()
+                batch_uncertainty[valid_indices] = uncertainty.cpu().numpy()
+                all_evidence.append(batch_evidence)
+                all_probs.append(batch_probs)
+                all_uncertainty.append(batch_uncertainty)
+            except Exception as exc:
+                if not getattr(args, "skip_bad_batches", False) or not _is_recoverable_batch_error(exc):
+                    raise
+
+                _append_skip_log(args, "predict_skip", 0, step, data.get("img_path", []), str(exc))
+                all_evidence.append(batch_evidence)
+                all_probs.append(batch_probs)
+                all_uncertainty.append(batch_uncertainty)
+                print(f"[WARN] Prediction batch recovered with placeholders: {exc}")
 
     evidence_array = np.concatenate(all_evidence)       # [N, K]
     alpha_array = evidence_array + 1                     # [N, K]
@@ -482,17 +654,27 @@ def edl_get_dataloader(args):
     return train_loader, valid_loader
 
 
-def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, logger, device):
+def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, logger, device):
     """EDL训练一个epoch"""
     model.train()
-    amp_enabled = _amp_enabled(args, device)
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
+    amp_enabled = scaler.is_enabled()
     losses = AverageMeter()
     start = end = time.time()
+    skipped_batches = 0
 
     progress_iter = tqdm(enumerate(train_loader), desc=f"[{epoch + 1:03d}/{args.epochs:03d} epoch train]",
                          total=len(train_loader))
     for step, data in progress_iter:
+        data, fallback_paths, fallback_errors = _filter_valid_subbatch(data)
+        if fallback_paths:
+            reason = fallback_errors[0] if fallback_errors else "fallback image used during training"
+            _append_skip_log(args, "train_fallback", epoch, step, fallback_paths, reason)
+            if data["x"].size(0) == 0:
+                skipped_batches += 1
+                optimizer.zero_grad(set_to_none=True)
+                print(f"[WARN] Skipping empty train batch at epoch {epoch + 1} step {step}: {reason}")
+                continue
+
         inputs = data['x'].to(device)
         if (
             args.arch.lower() == "breast_clip_det_b5_period_n_ft" or
@@ -504,12 +686,30 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
 
         batch_size = inputs.size(0)
         labels = data['y'].long().to(device)
+        if not torch.isfinite(inputs).all():
+            skipped_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            _append_skip_log(args, "train_skip", epoch, step, data.get('img_path', []), "non-finite train inputs")
+            print(f"[WARN] Skipping train batch at epoch {epoch + 1} step {step}: non-finite train inputs")
+            continue
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
             evidence = model(inputs)
             loss = criterion(evidence, labels)
+        if not torch.isfinite(evidence).all():
+            skipped_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            _append_skip_log(args, "train_skip", epoch, step, data.get('img_path', []), "non-finite train evidence")
+            print(f"[WARN] Skipping train batch at epoch {epoch + 1} step {step}: non-finite train evidence")
+            continue
+        if not torch.isfinite(loss):
+            skipped_batches += 1
+            optimizer.zero_grad(set_to_none=True)
+            _append_skip_log(args, "train_skip", epoch, step, data.get('img_path', []), "non-finite train loss")
+            print(f"[WARN] Skipping train batch at epoch {epoch + 1} step {step}: non-finite train loss")
+            continue
 
-        losses.update(loss.item(), batch_size)
+        losses.update(float(loss.item()), batch_size)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -521,6 +721,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
         postfix = {
             "lr": [optimizer.param_groups[0]['lr']],
             "loss": f"{losses.avg:.4f}",
+            "skipped": skipped_batches,
         }
         postfix.update(_cuda_postfix(device))
         progress_iter.set_postfix(postfix)
@@ -540,6 +741,10 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
             logger.add_scalar('train/epoch', epoch, index)
             logger.add_scalar('train/iter_loss', losses.avg, index)
             logger.add_scalar('train/iter_lr', optimizer.param_groups[0]['lr'], index)
+            logger.add_scalar('train/skipped_batches', skipped_batches, index)
+
+    if skipped_batches > 0:
+        print(f"Epoch {epoch + 1}: skipped {skipped_batches} train batch(es).")
 
     return losses.avg
 
@@ -554,6 +759,20 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
     progress_iter = tqdm(enumerate(valid_loader), desc=f"[{epoch + 1:03d}/{args.epochs:03d} epoch valid]",
                          total=len(valid_loader))
     for step, data in progress_iter:
+        raw_batch_size = len(data.get("img_path", []))
+        fallback_flags = list(data.get("is_fallback", []))
+        valid_indices = _valid_indices_from_fallback_flags(fallback_flags, raw_batch_size)
+        batch_pos_probs = np.full(raw_batch_size, 0.5, dtype=np.float32)
+
+        data, fallback_paths, fallback_errors = _filter_valid_subbatch(data)
+        if fallback_paths:
+            reason = fallback_errors[0] if fallback_errors else "fallback image used during validation"
+            _append_skip_log(args, "valid_fallback", epoch, step, fallback_paths, reason)
+            if data["x"].size(0) == 0:
+                preds.append(batch_pos_probs)
+                print(f"[WARN] Validation batch contains only fallback images at epoch {epoch + 1} step {step}: {reason}")
+                continue
+
         inputs = data['x'].to(device)
         batch_size = inputs.size(0)
         if (
@@ -566,17 +785,46 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
 
         labels = data['y'].long().to(device)
 
+        if not torch.isfinite(inputs).all():
+            _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid inputs")
+            print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid inputs")
+            loss = torch.tensor(0.0)
+            losses.update(float(loss.item()), batch_size)
+            preds.append(batch_pos_probs)
+            continue
         with torch.no_grad():
             evidence = model(inputs)
             loss = criterion(evidence, labels)
 
             # 计算正类概率用于AUC-ROC评估
+            if not torch.isfinite(evidence).all():
+                _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid evidence")
+                print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid evidence")
+                loss = torch.tensor(0.0)
+                losses.update(float(loss.item()), batch_size)
+                preds.append(batch_pos_probs)
+                continue
+            if not torch.isfinite(loss):
+                _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid loss")
+                print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid loss")
+                loss = torch.tensor(0.0)
+                losses.update(float(loss.item()), batch_size)
+                preds.append(batch_pos_probs)
+                continue
             probs = BreastClipEDLClassifier.compute_probabilities(evidence)
+            if not torch.isfinite(probs).all():
+                _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid probabilities")
+                print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid probabilities")
+                loss = torch.tensor(0.0)
+                losses.update(float(loss.item()), batch_size)
+                preds.append(batch_pos_probs)
+                continue
             # 取正类（类别1）的概率
             pos_probs = probs[:, -1].cpu().numpy()
 
         losses.update(loss.item(), batch_size)
-        preds.append(pos_probs)
+        batch_pos_probs[valid_indices] = pos_probs
+        preds.append(batch_pos_probs)
 
         postfix = {
             "loss": f"{losses.avg:.4f}",
