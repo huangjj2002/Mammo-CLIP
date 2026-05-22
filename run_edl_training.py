@@ -4,8 +4,8 @@ Mammo-CLIP + Evidential Deep Learning (EDL) finetuning entrypoint.
 
 SKIP_BAD_BATCHES = True
 
-CSV_PATH = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images/embed_data_testcohort_enriched.csv"
-DATA_DIR = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"
+CSV_PATH = r"/home/dhao4/workspace/hjj_workspace/data/data.csv"
+DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data"
 
 IMG_DIR = "images_png"
 CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
@@ -32,7 +32,7 @@ GPU_ID = 1
 
 SKIP_PREPARE = False
 SPLIT_MODE = "cohort"
-COHORT_COL = "cohert_num"
+COHORT_COL = "cohort_num"
 TRAIN_COHORTS = "1-8"
 TEST_COHORTS = "9-10"
 

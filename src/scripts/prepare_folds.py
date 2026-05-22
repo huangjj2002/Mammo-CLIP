@@ -3,7 +3,7 @@ Prepare split CSVs for Mammo-CLIP finetuning.
 
 Supports either:
 1. Legacy split-column based partitioning
-2. Cohort-driven partitioning via a CSV cohort column such as `cohert_num`
+2. Cohort-driven partitioning via a CSV cohort column such as `cohort_num`
 """
 
 import argparse
@@ -167,7 +167,7 @@ def main():
         choices=["cohort", "split"],
         help="Use cohort-driven splitting or legacy split-column based splitting.",
     )
-    parser.add_argument("--cohort-col", type=str, default="cohert_num", help="Cohort column name")
+    parser.add_argument("--cohort-col", type=str, default="cohort_num", help="Cohort column name")
     parser.add_argument("--train-cohorts", type=str, default="1-8", help="Train cohort spec, e.g. 1-8,12")
     parser.add_argument("--test-cohorts", type=str, default="9-10", help="Test cohort spec, e.g. 9-10")
     args = parser.parse_args()
