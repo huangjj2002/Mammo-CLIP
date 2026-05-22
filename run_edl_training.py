@@ -16,7 +16,7 @@ LABEL = "cancer"
 ARCH = "breast_clip_det_b5_period_n_ft"
 
 N_FOLDS = 5
-EPOCHS = 10
+EPOCHS = 25
 PATIENCE = 3
 BATCH_SIZE = 8
 LR = 5e-5
@@ -28,7 +28,7 @@ IMG_SIZE = [912, 1520]
 DEVICE = "cuda"
 NUM_WORKERS = 4
 APEX = "y"
-GPU_ID = 1
+GPU_ID = 3
 
 SKIP_PREPARE = False
 SPLIT_MODE = "cohort"
@@ -43,7 +43,7 @@ EDL_LOSS_TYPE = "digamma"
 EDL_NUM_CLASSES = 2
 EDL_KL_WEIGHT = 0.1
 EDL_ANNEALING_START = 0
-EDL_ANNEALING_EPOCHS = 5
+EDL_ANNEALING_EPOCHS = 10
 EDL_DROPOUT = 0.0
 EDL_HIDDEN_DIM = None
 
