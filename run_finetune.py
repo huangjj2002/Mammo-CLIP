@@ -1,49 +1,42 @@
-
-# =============================================================================
-# ========================= 配置区域 ==============================
-# =============================================================================
-
-
-CSV_PATH          = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images/embed_data_testcohort_enriched.csv"    # 原始CSV文件路径
-DATA_DIR          = r"/opt/localdata/Data/dh/dh_preprocessed/hjj_images"                                 # 数据根目录
-IMG_DIR           = "images_png"                                   # 图片目录
-CLIP_CHK_PT_PATH  = "./model/b5-model-best-epoch-7.tar"          # Mammo-CLIP预训练权重路径
-
-
-LABEL             = "cancer"                         
-ARCH              = "breast_clip_det_b5_period_n_ft"  
-
-
-N_FOLDS           = 5         # 交叉验证折数
-EPOCHS            = 25         # 每折最大训练轮数
-PATIENCE          = 5        # 早停
-BATCH_SIZE        = 16         
-LR                = 5e-5      
-SEED              = 42       
-WEIGHTED_BCE      = "y"       
-
-
-IMG_SIZE          = [912, 1520]  
-
-
-DEVICE            = "cuda"    
-NUM_WORKERS       = 4         
-APEX              = "y"       
-GPU_ID            = 0         # 使用的GPU编号
-
-
-SKIP_PREPARE      = False    
-
-
-
+import argparse
 import os
 import subprocess
 import sys
 
 
-def ensure_nltk_punkt():
+CSV_PATH = r"/home/dhao4/workspace/hjj_workspace/data/data.csv"
+DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data/hjj_images"
+IMG_DIR = "images_png"
+CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
 
+LABEL = "cancer"
+ARCH = "breast_clip_det_b5_period_n_ft"
+
+N_FOLDS = 0
+EPOCHS = 25
+PATIENCE = 3
+BATCH_SIZE = 8
+LR = 5e-5
+SEED = 42
+WEIGHTED_BCE = "y"
+
+IMG_SIZE = [912, 1520]
+
+DEVICE = "cuda"
+NUM_WORKERS = 4
+APEX = "y"
+GPU_ID = 3
+
+SKIP_PREPARE = False
+SPLIT_MODE = "cohort"
+COHORT_COL = "cohort_num"
+TRAIN_COHORTS = "1-8"
+TEST_COHORTS = "9-10"
+
+
+def ensure_nltk_punkt():
     import nltk
+
     try:
         nltk.data.find("tokenizers/punkt")
         print("[NLTK] punkt tokenizer already exists, skip download.")
@@ -52,81 +45,112 @@ def ensure_nltk_punkt():
         try:
             nltk.download("punkt", quiet=True)
             print("[NLTK] punkt tokenizer downloaded successfully.")
-        except Exception as e:
-            print(f"[NLTK WARNING] Failed to download punkt: {e}")
+        except Exception as exc:
+            print(f"[NLTK WARNING] Failed to download punkt: {exc}")
             print("[NLTK WARNING] If the server cannot connect to the internet, you can manually download punkt:")
             print("  Method 1: Run  python -c \"import nltk; nltk.download('punkt')\"")
             print("  Method 2: Download from https://github.com/nltk/nltk_data/blob/gh-pages/packages/tokenizers/punkt.zip")
             print("             and extract to ~/nltk_data/tokenizers/punkt/")
 
 
-def main():
+def build_parser():
+    parser = argparse.ArgumentParser(description="Run Mammo-CLIP finetuning.")
+    parser.add_argument("--csv-path", default=CSV_PATH, help="Path to the input CSV file.")
+    parser.add_argument("--data-dir", default=DATA_DIR, help="Directory containing images.")
+    parser.add_argument("--img-dir", default=IMG_DIR, help="Image directory relative to data-dir.")
+    parser.add_argument("--clip-chk-pt-path", default=CLIP_CHK_PT_PATH, help="Path to Mammo-CLIP checkpoint.")
+    parser.add_argument("--label", default=LABEL, help="Target label column.")
+    parser.add_argument("--arch", default=ARCH, help="Classifier architecture.")
+    parser.add_argument("--n-folds", type=int, default=N_FOLDS, help="Number of folds. Use 0 to disable CV.")
+    parser.add_argument("--epochs", type=int, default=EPOCHS, help="Training epochs.")
+    parser.add_argument("--patience", type=int, default=PATIENCE, help="Early stopping patience.")
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Training batch size.")
+    parser.add_argument("--lr", type=float, default=LR, help="Learning rate.")
+    parser.add_argument("--seed", type=int, default=SEED, help="Random seed.")
+    parser.add_argument("--weighted-bce", default=WEIGHTED_BCE, help="Whether to use weighted BCE: y/n.")
+    parser.add_argument("--img-size", nargs=2, type=int, default=IMG_SIZE, metavar=("WIDTH", "HEIGHT"))
+    parser.add_argument("--device", default=DEVICE, help="Training device, e.g. cuda or cpu.")
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS, help="Dataloader worker count.")
+    parser.add_argument("--apex", default=APEX, help="Whether to enable AMP: y/n.")
+    parser.add_argument("--gpu-id", type=int, default=GPU_ID, help="CUDA_VISIBLE_DEVICES value.")
+    parser.add_argument("--skip-prepare", action="store_true", default=SKIP_PREPARE, help="Skip split CSV preparation.")
+    parser.add_argument("--split-mode", choices=["cohort", "split"], default=SPLIT_MODE, help="Split source mode.")
+    parser.add_argument("--cohort-col", default=COHORT_COL, help="Cohort column name for cohort mode.")
+    parser.add_argument("--train-cohorts", default=TRAIN_COHORTS, help="Train cohort spec, e.g. 1-8,12.")
+    parser.add_argument("--test-cohorts", default=TEST_COHORTS, help="Test cohort spec, e.g. 9-10.")
+    return parser
 
+
+def main():
+    cli_args = build_parser().parse_args()
     ensure_nltk_punkt()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(GPU_ID)
-    print(f"[GPU] Using GPU {GPU_ID} (CUDA_VISIBLE_DEVICES={GPU_ID})")
+    os.environ["CUDA_VISIBLE_DEVICES"] = str(cli_args.gpu_id)
+    print(f"[GPU] Using GPU {cli_args.gpu_id} (CUDA_VISIBLE_DEVICES={cli_args.gpu_id})")
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     scripts_dir = os.path.join(project_root, "src", "scripts")
     codebase_dir = os.path.join(project_root, "src", "codebase")
 
-
-    clip_chk_pt_path = CLIP_CHK_PT_PATH
+    clip_chk_pt_path = cli_args.clip_chk_pt_path
     if not os.path.isabs(clip_chk_pt_path):
         clip_chk_pt_path = os.path.abspath(clip_chk_pt_path)
 
+    folds_csv_path = os.path.join(project_root, "train_with_test_folds.csv")
+    csv_filename = folds_csv_path
 
-    folds_csv_path = os.path.join(DATA_DIR, "train_with_test_folds.csv")
-    csv_filename = "train_with_test_folds.csv"
-
-
-    if not SKIP_PREPARE:
+    if not cli_args.skip_prepare:
         print("\n" + "=" * 60)
-        print("Step 1: Preparing 5-fold stratified split...")
+        print("Step 1: Preparing cohort-aware split CSVs...")
         print("=" * 60)
         prepare_cmd = [
             sys.executable,
             os.path.join(scripts_dir, "prepare_folds.py"),
-            "--csv_path", CSV_PATH,
+            "--csv_path", cli_args.csv_path,
             "--output_path", folds_csv_path,
-            "--n_folds", str(N_FOLDS),
-            "--seed", str(SEED),
+            "--n_folds", str(cli_args.n_folds),
+            "--seed", str(cli_args.seed),
+            "--split-mode", cli_args.split_mode,
+            "--cohort-col", cli_args.cohort_col,
+            "--train-cohorts", cli_args.train_cohorts,
+            "--test-cohorts", cli_args.test_cohorts,
         ]
         print(f"Running: {' '.join(prepare_cmd)}")
         result = subprocess.run(prepare_cmd, cwd=scripts_dir)
         if result.returncode != 0:
-            print("Error in fold preparation!")
+            print("Error in split preparation!")
             sys.exit(1)
-        print("Fold preparation completed!")
+        print("Split preparation completed!")
     else:
-        print(f"Skipping fold preparation. Using existing: {folds_csv_path}")
-
+        print(f"Skipping split preparation. Using existing: {folds_csv_path}")
 
     print("\n" + "=" * 60)
-    print("Step 2: Training classifier with 5-fold CV...")
+    if cli_args.n_folds == 0:
+        print("Step 2: Training classifier with train/test evaluation...")
+    else:
+        print(f"Step 2: Training classifier with {cli_args.n_folds}-fold CV...")
     print("=" * 60)
     train_cmd = [
         sys.executable,
         os.path.join(codebase_dir, "train_classifier.py"),
-        "--data-dir", DATA_DIR,
-        "--img-dir", IMG_DIR,
+        "--data-dir", cli_args.data_dir,
+        "--img-dir", cli_args.img_dir,
         "--csv-file", csv_filename,
         "--clip_chk_pt_path", clip_chk_pt_path,
         "--dataset", "custom",
-        "--arch", ARCH,
-        "--label", LABEL,
-        "--n_folds", str(N_FOLDS),
-        "--epochs", str(EPOCHS),
-        "--batch-size", str(BATCH_SIZE),
-        "--img-size", str(IMG_SIZE[0]), str(IMG_SIZE[1]),
-        "--lr", str(LR),
-        "--seed", str(SEED),
-        "--weighted-BCE", WEIGHTED_BCE,
-        "--patience", str(PATIENCE),
-        "--num-workers", str(NUM_WORKERS),
-        "--device", DEVICE,
-        "--apex", APEX,
+        "--arch", cli_args.arch,
+        "--label", cli_args.label,
+        "--n_folds", str(cli_args.n_folds),
+        "--epochs", str(cli_args.epochs),
+        "--batch-size", str(cli_args.batch_size),
+        "--img-size", str(cli_args.img_size[0]), str(cli_args.img_size[1]),
+        "--lr", str(cli_args.lr),
+        "--seed", str(cli_args.seed),
+        "--weighted-BCE", cli_args.weighted_bce,
+        "--patience", str(cli_args.patience),
+        "--num-workers", str(cli_args.num_workers),
+        "--device", cli_args.device,
+        "--apex", cli_args.apex,
     ]
     print(f"Running: {' '.join(train_cmd)}")
     result = subprocess.run(train_cmd, cwd=codebase_dir)
@@ -135,10 +159,14 @@ def main():
         sys.exit(1)
 
     print("\n" + "=" * 60)
-    print("All done! Check the 'outputs' directory for results.")
-    print("  - OOF predictions: outputs/custom/zz/classifier/.../*_oof_outputs.csv")
+    print("All done! Check the outputs directory for results.")
+    print("  - OOF-style predictions: outputs/custom/zz/classifier/.../*_oof_outputs.csv")
+    print("  - Holdout test predictions when n_folds=0: outputs/custom/zz/classifier/.../*_test_outputs.csv")
+    print("  - Per-fold loss curves: outputs/custom/zz/classifier/.../fold*_loss_curve.png")
+    print("  - Combined loss curves: outputs/custom/zz/classifier/.../loss_curves_summary.png")
     print("  - Per-fold all-data predictions: outputs/custom/zz/classifier/.../fold*_all_predictions.csv")
     print("  - Ensemble all-data predictions: outputs/custom/zz/classifier/.../ensemble_all_predictions.csv")
+    print("  - Per-fold metrics: outputs/custom/zz/classifier/.../fold*_metrics.csv")
     print("=" * 60)
 
 

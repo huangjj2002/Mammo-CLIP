@@ -1,28 +1,5 @@
 """
-一键微调脚本：自动完成数据预处理 → 5折训练 → 测试集预测 → Ensemble输出
-
-使用方法:
-    python run_finetune.py
-
-    # 或自定义参数
-    python run_finetune.py \
-        --csv_path "G:\data\train_with_test_data.csv" \
-        --data_dir "G:\data" \
-        --img_dir "images" \
-        --epochs 30 \
-        --batch_size 8 \
-        --lr 5e-5
-
-数据目录结构要求:
-    G:\data\
-    ├── train_with_test_data.csv   (原始CSV文件)
-    ├── images\                    (图片目录)
-    │   ├── 10006\                 (patient_id)
-    │   │   ├── 462822612.png      (image_id.png)
-    │   │   └── ...
-    │   ├── 10011\
-    │   └── ...
-    └── ...
+One-click finetuning helper for Mammo-CLIP.
 """
 
 import argparse
@@ -33,53 +10,40 @@ import sys
 
 def main():
     parser = argparse.ArgumentParser(description="Mammo-CLIP One-Click Finetuning Pipeline")
-    # 数据路径
-    parser.add_argument("--csv_path", default=r"/mnt/g/data/train_with_test_data_mini.csv", type=str,
-                        help="Path to original CSV file")
-    parser.add_argument("--data_dir", default=r"/mnt/g/data", type=str,
-                        help="Data directory (containing CSV and images)")
-    parser.add_argument("--img_dir", default="images_png", type=str,
-                        help="Image directory name (relative to data_dir)")
-    parser.add_argument("--clip_chk_pt_path", default="./model/b5-model-best-epoch-7.tar", type=str,
-                        help="Path to Mammo-CLIP pretrained checkpoint")
-
-    # 训练参数
-    parser.add_argument("--arch", default="breast_clip_det_b5_period_n_ft", type=str,
-                        help="Model architecture: breast_clip_det_b5_period_n_ft or breast_clip_det_b5_period_n_lp")
+    parser.add_argument("--csv_path", default=r"/mnt/g/data/train_with_test_data_mini.csv", type=str, help="Path to original CSV file")
+    parser.add_argument("--data_dir", default=r"/mnt/g/data", type=str, help="Data directory containing images")
+    parser.add_argument("--img_dir", default="images_png", type=str, help="Image directory name relative to data_dir")
+    parser.add_argument("--clip_chk_pt_path", default="./model/b5-model-best-epoch-7.tar", type=str, help="Path to Mammo-CLIP checkpoint")
+    parser.add_argument("--arch", default="breast_clip_det_b5_period_n_ft", type=str, help="Model architecture")
     parser.add_argument("--label", default="cancer", type=str, help="Label column in CSV")
-    parser.add_argument("--n_folds", default=5, type=int, help="Number of CV folds")
+    parser.add_argument("--n_folds", default=5, type=int, help="Number of folds. Use 0 to disable CV")
     parser.add_argument("--epochs", default=30, type=int, help="Training epochs")
     parser.add_argument("--batch_size", default=1, type=int, help="Batch size")
     parser.add_argument("--lr", default=5e-5, type=float, help="Learning rate")
-    parser.add_argument("--img_size", nargs="+", default=[912, 1520], type=int,
-                        help="Input image size as: width height")
+    parser.add_argument("--img_size", nargs="+", default=[912, 1520], type=int, help="Input image size: width height")
     parser.add_argument("--seed", default=42, type=int, help="Random seed")
-    parser.add_argument("--weighted_BCE", default="n", type=str,
-                        help="Use weighted BCE loss for imbalanced data (y/n)")
-    parser.add_argument("--patience", default=10, type=int,
-                        help="Early stopping patience (0 = disabled)")
-    parser.add_argument("--skip_prepare", action="store_true",
-                        help="Skip fold preparation (if already done)")
-
+    parser.add_argument("--weighted_BCE", default="n", type=str, help="Use weighted BCE loss (y/n)")
+    parser.add_argument("--patience", default=10, type=int, help="Early stopping patience")
+    parser.add_argument("--skip_prepare", action="store_true", help="Skip split CSV preparation")
+    parser.add_argument("--split-mode", choices=["cohort", "split"], default="cohort", help="Split source mode")
+    parser.add_argument("--cohort-col", default="cohert_num", help="Cohort column name")
+    parser.add_argument("--train-cohorts", default="1-8", help="Train cohort spec, e.g. 1-8,12")
+    parser.add_argument("--test-cohorts", default="9-10", help="Test cohort spec, e.g. 9-10")
     args = parser.parse_args()
 
-    # 获取脚本所在目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     codebase_dir = os.path.join(os.path.dirname(script_dir), "codebase")
     project_root = os.path.dirname(os.path.dirname(script_dir))
 
-    # 将相对路径转换为绝对路径，避免 subprocess cwd 变化导致路径失效
     if not os.path.isabs(args.clip_chk_pt_path):
         args.clip_chk_pt_path = os.path.abspath(args.clip_chk_pt_path)
 
-    # 生成的 folds CSV 路径
-    folds_csv_path = os.path.join(args.data_dir, "train_with_test_folds.csv")
-    csv_filename = "train_with_test_folds.csv"
+    folds_csv_path = os.path.join(project_root, "train_with_test_folds.csv")
+    csv_filename = folds_csv_path
 
-    # ===================== Step 1: 准备折划分 =====================
     if not args.skip_prepare:
         print("\n" + "=" * 60)
-        print("Step 1: Preparing 5-fold stratified split...")
+        print("Step 1: Preparing cohort-aware split CSVs...")
         print("=" * 60)
         prepare_cmd = [
             sys.executable,
@@ -88,19 +52,25 @@ def main():
             "--output_path", folds_csv_path,
             "--n_folds", str(args.n_folds),
             "--seed", str(args.seed),
+            "--split-mode", args.split_mode,
+            "--cohort-col", args.cohort_col,
+            "--train-cohorts", args.train_cohorts,
+            "--test-cohorts", args.test_cohorts,
         ]
         print(f"Running: {' '.join(prepare_cmd)}")
         result = subprocess.run(prepare_cmd, cwd=script_dir)
         if result.returncode != 0:
-            print("Error in fold preparation!")
+            print("Error in split preparation!")
             sys.exit(1)
-        print("Fold preparation completed!")
+        print("Split preparation completed!")
     else:
-        print(f"Skipping fold preparation. Using existing: {folds_csv_path}")
+        print(f"Skipping split preparation. Using existing: {folds_csv_path}")
 
-    # ===================== Step 2: 训练分类器 =====================
     print("\n" + "=" * 60)
-    print("Step 2: Training classifier with 5-fold CV...")
+    if args.n_folds == 0:
+        print("Step 2: Training classifier with train/test evaluation...")
+    else:
+        print(f"Step 2: Training classifier with {args.n_folds}-fold CV...")
     print("=" * 60)
     train_cmd = [
         sys.executable,
@@ -135,6 +105,7 @@ def main():
     print("  - OOF predictions: outputs/custom/zz/classifier/.../*_oof_outputs.csv")
     print("  - Per-fold all-data predictions: outputs/custom/zz/classifier/.../fold*_all_predictions.csv")
     print("  - Ensemble all-data predictions: outputs/custom/zz/classifier/.../ensemble_all_predictions.csv")
+    print("  - Per-fold metrics: outputs/custom/zz/classifier/.../fold*_metrics.csv")
     print("=" * 60)
 
 
