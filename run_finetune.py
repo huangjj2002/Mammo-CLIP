@@ -28,6 +28,8 @@ APEX = "y"
 GPU_ID = 4
 
 SKIP_PREPARE = True
+FOLDS_CSV_PATH = None
+OVERWRITE_FOLDS = False
 SPLIT_MODE = "cohort"
 COHORT_COL = "cohort_num"
 TRAIN_COHORTS = "1-8"
@@ -77,12 +79,13 @@ def build_parser():
     parser.add_argument("--prepare", dest="skip_prepare", action="store_false", help="Run split CSV preparation.")
     parser.add_argument(
         "--folds-csv-path",
-        default=None,
+        default=FOLDS_CSV_PATH,
         help="Where to write/read the prepared fold CSV. Relative paths are resolved from the project root.",
     )
     parser.add_argument(
         "--overwrite-folds",
         action="store_true",
+        default=OVERWRITE_FOLDS,
         help="Allow split preparation to overwrite an existing fold CSV.",
     )
     parser.add_argument("--split-mode", choices=["cohort", "split"], default=SPLIT_MODE, help="Split source mode.")
