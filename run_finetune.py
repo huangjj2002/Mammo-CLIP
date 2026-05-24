@@ -5,7 +5,7 @@ import sys
 
 
 CSV_PATH = r"/home/dhao4/workspace/hjj_workspace/data/data.csv"
-DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data/hjj_images"
+DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data"
 IMG_DIR = "images_png"
 CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
 
@@ -25,9 +25,9 @@ IMG_SIZE = [912, 1520]
 DEVICE = "cuda"
 NUM_WORKERS = 4
 APEX = "y"
-GPU_ID = 3
+GPU_ID = 4
 
-SKIP_PREPARE = False
+SKIP_PREPARE = True
 SPLIT_MODE = "cohort"
 COHORT_COL = "cohort_num"
 TRAIN_COHORTS = "1-8"

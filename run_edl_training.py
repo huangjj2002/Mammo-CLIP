@@ -15,7 +15,7 @@ CSV_SAVE_DIR = "output"
 LABEL = "cancer"
 ARCH = "breast_clip_det_b5_period_n_ft"
 
-N_FOLDS = 5
+N_FOLDS = 0
 EPOCHS = 25
 PATIENCE = 3
 BATCH_SIZE = 8
