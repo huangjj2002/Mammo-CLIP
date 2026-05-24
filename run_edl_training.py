@@ -93,6 +93,17 @@ def build_parser():
     parser.add_argument("--apex", default=APEX, help="Whether to enable AMP: y/n.")
     parser.add_argument("--gpu-id", type=int, default=GPU_ID, help="CUDA_VISIBLE_DEVICES value.")
     parser.add_argument("--skip-prepare", action="store_true", default=SKIP_PREPARE, help="Skip split CSV preparation.")
+    parser.add_argument("--prepare", dest="skip_prepare", action="store_false", help="Run split CSV preparation.")
+    parser.add_argument(
+        "--folds-csv-path",
+        default=None,
+        help="Where to write/read the prepared fold CSV. Relative paths are resolved from the project root.",
+    )
+    parser.add_argument(
+        "--overwrite-folds",
+        action="store_true",
+        help="Allow split preparation to overwrite an existing fold CSV.",
+    )
     parser.add_argument("--split-mode", choices=["cohort", "split"], default=SPLIT_MODE, help="Split source mode.")
     parser.add_argument("--cohort-col", default=COHORT_COL, help="Cohort column name for cohort mode.")
     parser.add_argument("--train-cohorts", default=TRAIN_COHORTS, help="Train cohort spec, e.g. 1-8,12.")
@@ -138,10 +149,17 @@ def main():
     if not os.path.isabs(clip_chk_pt_path):
         clip_chk_pt_path = os.path.abspath(clip_chk_pt_path)
 
-    folds_csv_path = os.path.join(project_root, "train_with_test_folds.csv")
+    folds_csv_path = cli_args.folds_csv_path or os.path.join(project_root, "train_with_test_folds.csv")
+    if not os.path.isabs(folds_csv_path):
+        folds_csv_path = os.path.abspath(os.path.join(project_root, folds_csv_path))
     csv_filename = folds_csv_path
 
     if not cli_args.skip_prepare:
+        if os.path.exists(folds_csv_path) and not cli_args.overwrite_folds:
+            print(f"Refusing to overwrite existing fold CSV: {folds_csv_path}")
+            print("Use --skip-prepare to reuse it, --folds-csv-path for a new file, or --overwrite-folds to replace it.")
+            sys.exit(1)
+
         print("\n" + "=" * 60)
         print("Step 1: Preparing cohort-aware split CSVs...")
         print("=" * 60)
@@ -164,6 +182,9 @@ def main():
             sys.exit(1)
         print("Split preparation completed!")
     else:
+        if not os.path.exists(folds_csv_path):
+            print(f"Requested --skip-prepare, but fold CSV does not exist: {folds_csv_path}")
+            sys.exit(1)
         print(f"Skipping split preparation. Using existing: {folds_csv_path}")
 
     print("\n" + "=" * 60)
