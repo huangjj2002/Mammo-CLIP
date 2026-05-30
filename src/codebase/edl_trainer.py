@@ -238,12 +238,19 @@ def _fold_indices(args):
     return [0] if args.n_folds == 0 else list(range(args.n_folds))
 
 
+def _normalized_split(df):
+    if "split" not in df.columns:
+        return pd.Series("train", index=df.index)
+    return df["split"].astype(str).str.strip().str.lower()
+
+
 def _build_fold_split_view(df, fold, n_folds):
     fold_view = df.copy()
     if "split" not in fold_view.columns:
         fold_view["split"] = "train"
     if n_folds == 0:
-        fold_view["split"] = fold_view["split"].where(fold_view["split"] == "test", "train")
+        split_values = _normalized_split(fold_view)
+        fold_view["split"] = split_values.where(split_values.isin(["val", "test"]), "train")
         return fold_view
 
     fold_view["split"] = "train"
@@ -303,15 +310,26 @@ def do_edl_experiments(args, device):
     print(f"df shape: {args.df.shape}")
     print(args.df.columns)
 
-    train_df = args.df[args.df["fold"] >= 0].reset_index(drop=True)
-    test_df = args.df[args.df["fold"] == -1].reset_index(drop=True)
+    split_values = _normalized_split(args.df)
+    train_pool_mask = args.df["fold"] >= 0
+    holdout_val_mask = train_pool_mask & (split_values == "val")
+    holdout_train_mask = train_pool_mask & (split_values != "val") & (split_values != "test")
+    test_mask = (args.df["fold"] == -1) | (split_values == "test")
+
+    train_df = args.df[train_pool_mask].reset_index(drop=True)
+    holdout_train_df = args.df[holdout_train_mask].reset_index(drop=True)
+    holdout_val_df = args.df[holdout_val_mask].reset_index(drop=True)
+    test_df = args.df[test_mask].reset_index(drop=True)
     predict_df = args.df.reset_index(drop=True)
     print(f"Training-pool samples: {len(train_df)}")
+    if args.n_folds == 0:
+        print(f"Holdout train samples: {len(holdout_train_df)}")
+        print(f"Holdout val samples: {len(holdout_val_df)}")
     print(f"Test samples: {len(test_df)}")
     print(f"Prediction output samples (all rows): {len(predict_df)}")
 
-    if args.n_folds == 0 and len(test_df) == 0:
-        raise ValueError("n_folds=0 requires a non-empty test split for per-epoch evaluation.")
+    if args.n_folds == 0 and len(holdout_val_df) == 0 and len(test_df) == 0:
+        raise ValueError("n_folds=0 requires a non-empty validation split or test split for per-epoch evaluation.")
 
     oof_df = pd.DataFrame()
     fold_prediction_arrays = []
@@ -322,9 +340,13 @@ def do_edl_experiments(args, device):
         seed_all(args.seed)
 
         if args.n_folds == 0:
-            args.train_folds = train_df.copy().reset_index(drop=True)
-            args.valid_folds = test_df.copy().reset_index(drop=True)
-            args.eval_split = "test"
+            args.train_folds = holdout_train_df.copy().reset_index(drop=True)
+            if len(holdout_val_df) > 0:
+                args.valid_folds = holdout_val_df.copy().reset_index(drop=True)
+                args.eval_split = "val"
+            else:
+                args.valid_folds = test_df.copy().reset_index(drop=True)
+                args.eval_split = "test"
         else:
             args.train_folds = train_df[train_df["fold"] != fold].reset_index(drop=True)
             args.valid_folds = train_df[train_df["fold"] == fold].reset_index(drop=True)

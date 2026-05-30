@@ -62,7 +62,7 @@ def edl_mse_loss(
     """
     EDL 均方误差损失 (Expected Mean Square Error under Dirichlet)
     
-    L_mse = Σ_j (y_j - α_j/S)^2 + y_j(1 - α_j/S)/S(S+1)
+    L_mse = Σ_j (y_j - α_j/S)^2 + α_j(S - α_j)/(S^2(S+1))
     正则化项使用KL散度，带退火系数
     
     Args:
@@ -250,6 +250,7 @@ class EDLLoss(nn.Module):
             else:
                 target_indices = torch.argmax(target_onehot, dim=1)
             sample_weights = self.class_weights.to(output.device)[target_indices]
-            data_loss = (per_sample_data_loss * sample_weights).mean()
+            weighted_loss = per_sample_data_loss * sample_weights
+            data_loss = weighted_loss.sum() / sample_weights.sum().clamp_min(1e-8)
 
         return data_loss + self.kl_weight * annealing_coef * kl_loss

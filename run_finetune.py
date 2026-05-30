@@ -8,6 +8,9 @@ CSV_PATH = r"/home/dhao4/workspace/hjj_workspace/data/data.csv"
 DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data"
 IMG_DIR = "images_png"
 CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
+MODEL_SAVE_DIR = "checkpoints"
+CSV_SAVE_DIR = "outputs"
+TENSORBOARD_DIR = "logs"
 
 LABEL = "cancer"
 ARCH = "breast_clip_det_b5_period_n_ft"
@@ -17,6 +20,8 @@ EPOCHS = 25
 PATIENCE = 3
 BATCH_SIZE = 8
 LR = 5e-5
+WEIGHT_DECAY = 1e-4
+WARMUP_EPOCHS = 1
 SEED = 42
 WEIGHTED_BCE = "y"
 
@@ -27,13 +32,15 @@ NUM_WORKERS = 4
 APEX = "y"
 GPU_ID = 4
 
-SKIP_PREPARE = True
-FOLDS_CSV_PATH = None
+SKIP_PREPARE = False
+FOLDS_CSV_PATH = "folds/finetune_holdout_seed42.csv"
 OVERWRITE_FOLDS = False
 SPLIT_MODE = "cohort"
 COHORT_COL = "cohort_num"
 TRAIN_COHORTS = "1-8"
 TEST_COHORTS = "9-10"
+HOLDOUT_VAL_PERCENT = 20.0
+HOLDOUT_VAL_MAX_PERCENT = 20.0
 
 
 def ensure_nltk_punkt():
@@ -68,6 +75,8 @@ def build_parser():
     parser.add_argument("--patience", type=int, default=PATIENCE, help="Early stopping patience.")
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE, help="Training batch size.")
     parser.add_argument("--lr", type=float, default=LR, help="Learning rate.")
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY, help="Weight decay.")
+    parser.add_argument("--warmup-epochs", type=float, default=WARMUP_EPOCHS, help="Warmup epochs.")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed.")
     parser.add_argument("--weighted-bce", default=WEIGHTED_BCE, help="Whether to use weighted BCE: y/n.")
     parser.add_argument("--img-size", nargs=2, type=int, default=IMG_SIZE, metavar=("WIDTH", "HEIGHT"))
@@ -75,6 +84,9 @@ def build_parser():
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS, help="Dataloader worker count.")
     parser.add_argument("--apex", default=APEX, help="Whether to enable AMP: y/n.")
     parser.add_argument("--gpu-id", type=int, default=GPU_ID, help="CUDA_VISIBLE_DEVICES value.")
+    parser.add_argument("--model-save-dir", default=MODEL_SAVE_DIR, help="Project-local checkpoint directory.")
+    parser.add_argument("--csv-save-dir", default=CSV_SAVE_DIR, help="Project-local prediction directory.")
+    parser.add_argument("--tensorboard-dir", default=TENSORBOARD_DIR, help="Project-local tensorboard directory.")
     parser.add_argument("--skip-prepare", action="store_true", default=SKIP_PREPARE, help="Skip split CSV preparation.")
     parser.add_argument("--prepare", dest="skip_prepare", action="store_false", help="Run split CSV preparation.")
     parser.add_argument(
@@ -92,6 +104,21 @@ def build_parser():
     parser.add_argument("--cohort-col", default=COHORT_COL, help="Cohort column name for cohort mode.")
     parser.add_argument("--train-cohorts", default=TRAIN_COHORTS, help="Train cohort spec, e.g. 1-8,12.")
     parser.add_argument("--test-cohorts", default=TEST_COHORTS, help="Test cohort spec, e.g. 9-10.")
+    parser.add_argument(
+        "--holdout-val-percent",
+        type=float,
+        default=HOLDOUT_VAL_PERCENT,
+        help="Only used when n-folds=0: percent of training samples to reserve for validation.",
+    )
+    parser.add_argument(
+        "--holdout-val-max-percent",
+        type=float,
+        default=HOLDOUT_VAL_MAX_PERCENT,
+        help=(
+            "Only used when n-folds=0: max validation sample percent if the initial "
+            "validation split has only one class. Use 0 to disable expansion."
+        ),
+    )
     return parser
 
 
@@ -133,8 +160,11 @@ def main():
             "--seed", str(cli_args.seed),
             "--split-mode", cli_args.split_mode,
             "--cohort-col", cli_args.cohort_col,
+            "--label-col", cli_args.label,
             "--train-cohorts", cli_args.train_cohorts,
             "--test-cohorts", cli_args.test_cohorts,
+            "--holdout-val-percent", str(cli_args.holdout_val_percent),
+            "--holdout-val-max-percent", str(cli_args.holdout_val_max_percent),
         ]
         print(f"Running: {' '.join(prepare_cmd)}")
         result = subprocess.run(prepare_cmd, cwd=scripts_dir)
@@ -149,8 +179,9 @@ def main():
         print(f"Skipping split preparation. Using existing: {folds_csv_path}")
 
     print("\n" + "=" * 60)
+    print("Model entry: classifier fine-tuning")
     if cli_args.n_folds == 0:
-        print("Step 2: Training classifier with train/test evaluation...")
+        print("Step 2: Training classifier with holdout validation/test evaluation...")
     else:
         print(f"Step 2: Training classifier with {cli_args.n_folds}-fold CV...")
     print("=" * 60)
@@ -164,11 +195,16 @@ def main():
         "--dataset", "custom",
         "--arch", cli_args.arch,
         "--label", cli_args.label,
+        "--checkpoints", os.path.join(project_root, cli_args.model_save_dir),
+        "--output_path", os.path.join(project_root, cli_args.csv_save_dir),
+        "--tensorboard-path", os.path.join(project_root, cli_args.tensorboard_dir),
         "--n_folds", str(cli_args.n_folds),
         "--epochs", str(cli_args.epochs),
         "--batch-size", str(cli_args.batch_size),
         "--img-size", str(cli_args.img_size[0]), str(cli_args.img_size[1]),
         "--lr", str(cli_args.lr),
+        "--weight-decay", str(cli_args.weight_decay),
+        "--warmup-epochs", str(cli_args.warmup_epochs),
         "--seed", str(cli_args.seed),
         "--weighted-BCE", cli_args.weighted_bce,
         "--patience", str(cli_args.patience),
@@ -185,7 +221,7 @@ def main():
     print("\n" + "=" * 60)
     print("All done! Check the outputs directory for results.")
     print("  - OOF-style predictions: outputs/custom/zz/classifier/.../*_oof_outputs.csv")
-    print("  - Holdout test predictions when n_folds=0: outputs/custom/zz/classifier/.../*_test_outputs.csv")
+    print("  - Holdout eval predictions when n_folds=0: outputs/custom/zz/classifier/.../*_val_outputs.csv or *_test_outputs.csv")
     print("  - Per-fold loss curves: outputs/custom/zz/classifier/.../fold*_loss_curve.png")
     print("  - Combined loss curves: outputs/custom/zz/classifier/.../loss_curves_summary.png")
     print("  - Per-fold all-data predictions: outputs/custom/zz/classifier/.../fold*_all_predictions.csv")

@@ -7,6 +7,7 @@ Supports either:
 """
 
 import argparse
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -103,14 +104,118 @@ def build_base_split(df, args):
     return df
 
 
-def assign_train_pool_folds(train_df, n_folds, seed):
+def _validate_percent(name, value):
+    if value < 0 or value >= 100:
+        raise ValueError(f"{name} must be in [0, 100). Got {value}.")
+
+
+def assign_holdout_validation(train_df, val_percent, val_max_percent, seed, label_col):
     train_df = train_df.copy().reset_index(drop=True)
-    if n_folds == 0:
-        train_df["fold"] = 0
+    train_df["split"] = "train"
+    train_df["fold"] = 0
+
+    if val_percent <= 0:
         return train_df
 
-    patient_labels = train_df.groupby("patient_id")["cancer"].max().reset_index()
-    patient_labels.columns = ["patient_id", "patient_cancer"]
+    patient_labels = (
+        train_df.groupby("patient_id")
+        .agg(patient_label=(label_col, "max"), sample_count=("patient_id", "size"))
+        .reset_index()
+    )
+    n_patients = len(patient_labels)
+    if n_patients < 2:
+        raise ValueError("Need at least 2 unique training patients to create a holdout validation split.")
+
+    if val_max_percent <= 0:
+        val_max_percent = val_percent
+    if val_max_percent < val_percent:
+        raise ValueError("--holdout-val-max-percent must be 0 or >= --holdout-val-percent.")
+
+    total_samples = len(train_df)
+    target_sample_count = int(math.ceil(total_samples * val_percent / 100.0))
+    target_sample_count = min(max(target_sample_count, 1), total_samples - 1)
+    max_sample_count = int(math.ceil(total_samples * val_max_percent / 100.0))
+    max_sample_count = min(max(max_sample_count, target_sample_count), total_samples - 1)
+
+    shuffled = patient_labels.sample(frac=1.0, random_state=seed).reset_index(drop=True)
+    val_patient_ids = []
+    val_sample_count = 0
+    remaining_rows = []
+    for row in shuffled.to_dict("records"):
+        if val_sample_count < target_sample_count and len(val_patient_ids) < n_patients - 1:
+            val_patient_ids.append(row["patient_id"])
+            val_sample_count += int(row["sample_count"])
+        else:
+            remaining_rows.append(row)
+    remaining = pd.DataFrame(remaining_rows)
+
+    all_classes = set(patient_labels["patient_label"].tolist())
+    val_classes = set(patient_labels.loc[patient_labels["patient_id"].isin(val_patient_ids), "patient_label"].tolist())
+
+    if len(all_classes) > 1 and len(val_classes) < 2:
+        while len(val_classes) < 2 and len(val_patient_ids) < n_patients - 1:
+            missing_classes = all_classes - val_classes
+            if remaining.empty:
+                break
+            candidate_rows = remaining[remaining["patient_label"].isin(missing_classes)].sort_values("sample_count")
+            if candidate_rows.empty:
+                break
+
+            candidate_idx = None
+            for idx, candidate_row in candidate_rows.iterrows():
+                next_sample_count = val_sample_count + int(candidate_row["sample_count"])
+                if next_sample_count <= max_sample_count:
+                    candidate_idx = idx
+                    break
+            if candidate_idx is None:
+                break
+
+            candidate = remaining.loc[candidate_idx]
+            val_patient_ids.append(candidate["patient_id"])
+            val_classes.add(candidate["patient_label"])
+            val_sample_count += int(candidate["sample_count"])
+            remaining = remaining.drop(index=candidate_idx).reset_index(drop=True)
+
+    val_mask = train_df["patient_id"].isin(val_patient_ids)
+    if val_mask.all():
+        raise ValueError("Holdout validation split consumed all training rows; reduce --holdout-val-percent.")
+
+    train_df.loc[val_mask, "split"] = "val"
+
+    val_df = train_df[val_mask]
+    remaining_train_df = train_df[~val_mask]
+    val_patient_count = val_df["patient_id"].nunique()
+    val_sample_count = len(val_df)
+    val_sample_percent = val_sample_count / max(len(train_df), 1) * 100.0
+    print(
+        f"Holdout validation split: {val_patient_count}/{n_patients} patients, "
+        f"{val_sample_count}/{len(train_df)} samples ({val_sample_percent:.2f}%)"
+    )
+    print(f"  Train sample {label_col} distribution:\n{remaining_train_df[label_col].value_counts().sort_index()}")
+    print(f"  Val sample {label_col} distribution:\n{val_df[label_col].value_counts().sort_index()}")
+    if len(all_classes) > 1 and len(val_classes) < 2:
+        print(
+            "  Warning: validation split still has one class after reaching "
+            f"holdout max percent ({val_max_percent:g}%)."
+        )
+
+    return train_df
+
+
+def assign_train_pool_folds(
+    train_df,
+    n_folds,
+    seed,
+    label_col,
+    holdout_val_percent=0.0,
+    holdout_val_max_percent=0.0,
+):
+    train_df = train_df.copy().reset_index(drop=True)
+    if n_folds == 0:
+        return assign_holdout_validation(train_df, holdout_val_percent, holdout_val_max_percent, seed, label_col)
+
+    patient_labels = train_df.groupby("patient_id")[label_col].max().reset_index()
+    patient_labels.columns = ["patient_id", "patient_label"]
 
     if len(patient_labels) < n_folds:
         raise ValueError(
@@ -119,13 +224,13 @@ def assign_train_pool_folds(train_df, n_folds, seed):
 
     train_df["fold"] = -1
     patient_ids = patient_labels["patient_id"].values
-    patient_cancer = patient_labels["patient_cancer"].values
+    patient_labels_array = patient_labels["patient_label"].values
     splitter = StratifiedGroupKFold(n_splits=n_folds, shuffle=True, random_state=seed)
 
-    for fold_idx, (_, val_idx) in enumerate(splitter.split(patient_ids, patient_cancer, groups=patient_ids)):
+    for fold_idx, (_, val_idx) in enumerate(splitter.split(patient_ids, patient_labels_array, groups=patient_ids)):
         val_patients = patient_ids[val_idx]
         train_df.loc[train_df["patient_id"].isin(val_patients), "fold"] = fold_idx
-        n_pos = int(patient_cancer[val_idx].sum())
+        n_pos = int(patient_labels_array[val_idx].sum())
         n_total = int(len(val_idx))
         ratio = (n_pos / n_total * 100.0) if n_total else 0.0
         print(f"  Fold {fold_idx}: {n_total} patients, {n_pos} positive ({ratio:.1f}%)")
@@ -143,7 +248,7 @@ def save_per_fold_csvs(result_df, output_path, n_folds):
     for fold_idx in fold_indices:
         fold_df = result_df.copy()
         if n_folds == 0:
-            fold_df["split"] = fold_df["split"].where(fold_df["split"] == "test", "train")
+            fold_df["split"] = fold_df["split"].where(fold_df["split"].isin(["val", "test"]), "train")
         else:
             fold_df["split"] = "train"
             fold_df.loc[fold_df["fold"] == fold_idx, "split"] = "val"
@@ -168,12 +273,32 @@ def main():
         help="Use cohort-driven splitting or legacy split-column based splitting.",
     )
     parser.add_argument("--cohort-col", type=str, default="cohort_num", help="Cohort column name")
+    parser.add_argument("--label-col", type=str, default="cancer", help="Target label column for stratification")
     parser.add_argument("--train-cohorts", type=str, default="1-8", help="Train cohort spec, e.g. 1-8,12")
     parser.add_argument("--test-cohorts", type=str, default="9-10", help="Test cohort spec, e.g. 9-10")
+    parser.add_argument(
+        "--holdout-val-percent",
+        type=float,
+        default=0.0,
+        help="Only used when n_folds=0: percent of training samples to reserve for validation by patient.",
+    )
+    parser.add_argument(
+        "--holdout-val-max-percent",
+        type=float,
+        default=0.0,
+        help=(
+            "Only used when n_folds=0: maximum validation sample percent if the initial "
+            "validation split has only one class. Use 0 to disable expansion."
+        ),
+    )
     args = parser.parse_args()
 
     if args.n_folds < 0:
         raise ValueError("--n_folds must be >= 0.")
+    _validate_percent("--holdout-val-percent", args.holdout_val_percent)
+    _validate_percent("--holdout-val-max-percent", args.holdout_val_max_percent)
+    if args.n_folds > 0 and (args.holdout_val_percent > 0 or args.holdout_val_max_percent > 0):
+        print("Ignoring holdout validation options because n_folds > 0.")
 
     csv_path = Path(args.csv_path)
     output_path = Path(args.output_path)
@@ -182,7 +307,7 @@ def main():
     print(f"Total samples: {len(df)}")
     print(f"Columns: {df.columns.tolist()}")
 
-    required_columns = {"patient_id", "image_id", "cancer"}
+    required_columns = {"patient_id", "image_id", args.label_col}
     missing_columns = sorted(required_columns - set(df.columns))
     if missing_columns:
         raise ValueError(f"Missing required columns: {missing_columns}")
@@ -193,21 +318,31 @@ def main():
 
     df = build_base_split(df, args)
     print(f"Prepared split distribution:\n{df['split'].value_counts()}")
-    print(f"Cancer distribution:\n{df['cancer'].value_counts()}")
+    print(f"{args.label_col} distribution:\n{df[args.label_col].value_counts()}")
 
     train_df = df[df["split"] == "train"].copy().reset_index(drop=True)
     test_df = df[df["split"] == "test"].copy().reset_index(drop=True)
 
     print(f"\nTraining-pool samples: {len(train_df)}")
     print(f"Test samples: {len(test_df)}")
-    print(f"Training-pool cancer rate: {train_df['cancer'].mean():.4f}")
+    print(f"Training-pool {args.label_col} rate: {train_df[args.label_col].mean():.4f}")
     print(f"Unique patients in training pool: {train_df['patient_id'].nunique()}")
 
-    train_df = assign_train_pool_folds(train_df, args.n_folds, args.seed)
+    train_df = assign_train_pool_folds(
+        train_df,
+        args.n_folds,
+        args.seed,
+        args.label_col,
+        holdout_val_percent=args.holdout_val_percent,
+        holdout_val_max_percent=args.holdout_val_max_percent,
+    )
     test_df["fold"] = -1
 
     result_df = pd.concat([train_df, test_df], ignore_index=True)
-    result_df["split"] = result_df["split"].where(result_df["split"] == "test", "train")
+    if args.n_folds == 0:
+        result_df["split"] = result_df["split"].where(result_df["split"].isin(["val", "test"]), "train")
+    else:
+        result_df["split"] = result_df["split"].where(result_df["split"] == "test", "train")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     result_df.to_csv(output_path, index=False)
@@ -215,7 +350,8 @@ def main():
     print(f"Total output samples: {len(result_df)}")
 
     if args.n_folds == 0:
-        print("Fold distribution: disabled (n_folds=0, all training-pool rows use fold=0)")
+        print("Fold distribution: disabled (n_folds=0, all non-test rows use fold=0)")
+        print(f"Final split distribution:\n{result_df['split'].value_counts()}")
     else:
         print(f"Fold distribution:\n{train_df['fold'].value_counts().sort_index()}")
 

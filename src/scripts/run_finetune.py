@@ -22,13 +22,25 @@ def main():
     parser.add_argument("--lr", default=5e-5, type=float, help="Learning rate")
     parser.add_argument("--img_size", nargs="+", default=[912, 1520], type=int, help="Input image size: width height")
     parser.add_argument("--seed", default=42, type=int, help="Random seed")
-    parser.add_argument("--weighted_BCE", default="n", type=str, help="Use weighted BCE loss (y/n)")
+    parser.add_argument("--weighted_BCE", default="y", type=str, help="Use weighted BCE loss (y/n)")
     parser.add_argument("--patience", default=10, type=int, help="Early stopping patience")
     parser.add_argument("--skip_prepare", action="store_true", help="Skip split CSV preparation")
     parser.add_argument("--split-mode", choices=["cohort", "split"], default="cohort", help="Split source mode")
-    parser.add_argument("--cohort-col", default="cohert_num", help="Cohort column name")
+    parser.add_argument("--cohort-col", default="cohort_num", help="Cohort column name")
     parser.add_argument("--train-cohorts", default="1-8", help="Train cohort spec, e.g. 1-8,12")
     parser.add_argument("--test-cohorts", default="9-10", help="Test cohort spec, e.g. 9-10")
+    parser.add_argument(
+        "--holdout-val-percent",
+        default=20.0,
+        type=float,
+        help="Only used when n_folds=0: percent of training samples to reserve for validation",
+    )
+    parser.add_argument(
+        "--holdout-val-max-percent",
+        default=20.0,
+        type=float,
+        help="Only used when n_folds=0: max validation sample percent if the initial val split has one class",
+    )
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -38,7 +50,7 @@ def main():
     if not os.path.isabs(args.clip_chk_pt_path):
         args.clip_chk_pt_path = os.path.abspath(args.clip_chk_pt_path)
 
-    folds_csv_path = os.path.join(project_root, "train_with_test_folds.csv")
+    folds_csv_path = os.path.join(project_root, "folds", "finetune_holdout_seed42.csv")
     csv_filename = folds_csv_path
 
     if not args.skip_prepare:
@@ -54,8 +66,11 @@ def main():
             "--seed", str(args.seed),
             "--split-mode", args.split_mode,
             "--cohort-col", args.cohort_col,
+            "--label-col", args.label,
             "--train-cohorts", args.train_cohorts,
             "--test-cohorts", args.test_cohorts,
+            "--holdout-val-percent", str(args.holdout_val_percent),
+            "--holdout-val-max-percent", str(args.holdout_val_max_percent),
         ]
         print(f"Running: {' '.join(prepare_cmd)}")
         result = subprocess.run(prepare_cmd, cwd=script_dir)

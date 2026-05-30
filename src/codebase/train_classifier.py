@@ -118,10 +118,15 @@ def main(args):
             csv_path = Path(args.data_dir) / csv_path
         df = pd.read_csv(csv_path)
         train_df = df[df["fold"] >= 0]
+        if "split" in train_df.columns:
+            split_values = train_df["split"].astype(str).str.strip().str.lower()
+            train_only_df = train_df[(split_values != "val") & (split_values != "test")]
+        else:
+            train_only_df = train_df
         args.BCE_weights = {}
         if args.n_folds == 0:
-            n_neg = (train_df[args.label] == 0).sum()
-            n_pos = (train_df[args.label] == 1).sum()
+            n_neg = (train_only_df[args.label] == 0).sum()
+            n_pos = (train_only_df[args.label] == 1).sum()
             args.BCE_weights["fold0"] = n_neg / max(n_pos, 1)
         else:
             for fold in range(args.n_folds):
