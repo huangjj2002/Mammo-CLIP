@@ -9,6 +9,7 @@ Evidential Deep Learning (EDL) 训练/验证/测试模块
 """
 
 import gc
+import math
 import time
 from pathlib import Path
 
@@ -49,6 +50,20 @@ def _cuda_postfix(device):
 def _empty_cuda_cache(device):
     if str(device).startswith("cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def _edl_annealing_gate_epoch(args):
+    annealing_start = float(getattr(args, "edl_annealing_start", 0))
+    annealing_epochs = max(float(getattr(args, "edl_annealing_epochs", 10)), 1.0)
+    return annealing_start + annealing_epochs
+
+
+def _is_edl_annealing_complete(args, epoch):
+    return float(epoch) >= _edl_annealing_gate_epoch(args)
+
+
+def _edl_annealing_gate_visible_epoch(args):
+    return int(math.ceil(_edl_annealing_gate_epoch(args))) + 1
 
 
 def _assert_finite_tensor(name, tensor, img_paths=None):
@@ -163,11 +178,18 @@ def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler
     best_aucroc = float(ckpt.get("best_aucroc", 0.0))
     epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
     history = ckpt.get("history", history)
+    if not _is_edl_annealing_complete(args, int(ckpt.get("epoch", -1))):
+        epochs_no_improve = 0
 
     print(
         f"Resumed fold {args.cur_fold} from {last_ckpt_path} "
         f"(next_epoch={start_epoch + 1}, best_aucroc={best_aucroc:.4f})"
     )
+    if not _is_edl_annealing_complete(args, start_epoch - 1):
+        print(
+            f"Early stopping counter reset on resume; EDL annealing gate opens at visible epoch "
+            f"{_edl_annealing_gate_visible_epoch(args)}."
+        )
     return start_epoch, best_aucroc, epochs_no_improve, history
 
 
@@ -481,6 +503,12 @@ def edl_train_loop(args, device):
     for epoch in range(start_epoch, args.epochs):
         start_time = time.time()
         criterion.current_epoch = epoch
+        annealing_complete = _is_edl_annealing_complete(args, epoch)
+        if not annealing_complete:
+            print(
+                f"Epoch {epoch + 1} - early stopping paused until visible epoch "
+                f"{_edl_annealing_gate_visible_epoch(args)} while EDL annealing is active."
+            )
 
         avg_loss = edl_train_fn(
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, logger, device
@@ -530,13 +558,13 @@ def edl_train_loop(args, device):
                 }, _fold_best_model_path(args)
             )
         else:
-            epochs_no_improve += 1
+            epochs_no_improve = epochs_no_improve + 1 if annealing_complete else 0
 
         _save_last_checkpoint(
             args, model, optimizer, scheduler, scaler, epoch, best_aucroc, epochs_no_improve, history
         )
 
-        if args.patience > 0 and epochs_no_improve >= args.patience:
+        if annealing_complete and args.patience > 0 and epochs_no_improve >= args.patience:
             print(f'Early stopping at epoch {epoch + 1}: no improvement for {args.patience} epochs, '
                   f'best AUC-ROC: {best_aucroc:.4f}')
             break
