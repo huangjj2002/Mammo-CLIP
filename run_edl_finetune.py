@@ -10,7 +10,7 @@ DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data"
 IMG_DIR = "images_png"
 CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
 MODEL_SAVE_DIR = "best_model"
-CSV_SAVE_DIR = "output"
+CSV_SAVE_DIR = "output_data"
 TENSORBOARD_DIR = "logs"
 
 LABEL = "cancer"
@@ -34,7 +34,7 @@ APEX = "y"
 GPU_ID = 2
 
 SKIP_PREPARE = False
-FOLDS_CSV_PATH = "folds/edl_holdout_seed42.csv"
+FOLDS_CSV_PATH = "folds/edl_holdout.csv"
 OVERWRITE_FOLDS = False
 SPLIT_MODE = "cohort"
 COHORT_COL = "cohort_num"
@@ -142,6 +142,7 @@ def build_parser():
     parser.add_argument("--model-save-dir", default=MODEL_SAVE_DIR, help="Project-local checkpoint directory.")
     parser.add_argument("--csv-save-dir", default=CSV_SAVE_DIR, help="Project-local prediction directory.")
     parser.add_argument("--tensorboard-dir", default=TENSORBOARD_DIR, help="Project-local tensorboard directory.")
+    parser.add_argument("--run-id", default=None, help="Run identifier appended to output/checkpoint/log directories.")
     parser.add_argument("--resume", action="store_true", default=RESUME_TRAINING, help="Resume from last per-fold checkpoint.")
     parser.add_argument(
         "--skip-bad-batches",
@@ -229,7 +230,7 @@ def main():
 
     sys.path.insert(0, codebase_dir)
     from edl_trainer import do_edl_experiments
-    from utils import seed_all
+    from utils import append_run_id, seed_all
 
     args = argparse.Namespace()
     args.data_dir = cli_args.data_dir
@@ -294,10 +295,11 @@ def main():
 
     seed_all(args.seed)
 
-    args.root = (
+    base_root = (
         f"lr_{args.lr}_epochs_{args.epochs}_edl_{args.edl_loss_type}_{args.label}_"
         f"data_frac_{args.data_frac}_mode_{args.train_mode}"
     )
+    args.root, args.run_id = append_run_id(base_root, cli_args.run_id)
     chk_pt_path = Path(args.checkpoints) / args.dataset / "edl_classifier" / args.arch / args.root
     output_path = Path(args.output_path) / args.dataset / "zz" / "edl_classifier" / args.arch / args.root
     tb_logs_path = Path(args.tensorboard_path) / args.dataset / "edl_classifier" / args.arch / args.root
@@ -311,6 +313,7 @@ def main():
     os.makedirs(tb_logs_path, exist_ok=True)
 
     print("====================> EDL Paths <====================")
+    print(f"run_id: {args.run_id}")
     print(f"checkpoint_path: {chk_pt_path}")
     print(f"output_path: {output_path}")
     print(f"tb_logs_path: {tb_logs_path}")

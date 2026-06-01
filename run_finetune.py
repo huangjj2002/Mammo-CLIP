@@ -9,7 +9,7 @@ DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data"
 IMG_DIR = "images_png"
 CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
 MODEL_SAVE_DIR = "checkpoints"
-CSV_SAVE_DIR = "outputs"
+CSV_SAVE_DIR = "output_data"
 TENSORBOARD_DIR = "logs"
 
 LABEL = "cancer"
@@ -33,7 +33,7 @@ APEX = "y"
 GPU_ID = 4
 
 SKIP_PREPARE = False
-FOLDS_CSV_PATH = "folds/finetune_holdout_seed42.csv"
+FOLDS_CSV_PATH = "folds/finetune_holdout.csv"
 OVERWRITE_FOLDS = False
 SPLIT_MODE = "cohort"
 COHORT_COL = "cohort_num"
@@ -87,6 +87,7 @@ def build_parser():
     parser.add_argument("--model-save-dir", default=MODEL_SAVE_DIR, help="Project-local checkpoint directory.")
     parser.add_argument("--csv-save-dir", default=CSV_SAVE_DIR, help="Project-local prediction directory.")
     parser.add_argument("--tensorboard-dir", default=TENSORBOARD_DIR, help="Project-local tensorboard directory.")
+    parser.add_argument("--run-id", default=None, help="Run identifier appended to output/checkpoint/log directories.")
     parser.add_argument("--skip-prepare", action="store_true", default=SKIP_PREPARE, help="Skip split CSV preparation.")
     parser.add_argument("--prepare", dest="skip_prepare", action="store_false", help="Run split CSV preparation.")
     parser.add_argument(
@@ -212,6 +213,8 @@ def main():
         "--device", cli_args.device,
         "--apex", cli_args.apex,
     ]
+    if cli_args.run_id:
+        train_cmd.extend(["--run-id", cli_args.run_id])
     print(f"Running: {' '.join(train_cmd)}")
     result = subprocess.run(train_cmd, cwd=codebase_dir)
     if result.returncode != 0:

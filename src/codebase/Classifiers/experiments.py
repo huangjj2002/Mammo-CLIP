@@ -19,7 +19,14 @@ from Datasets.dataset_concepts import MammoDataset, collator_mammo_dataset_w_con
 from Datasets.dataset_utils import get_eval_transforms, get_transforms
 from breastclip.scheduler import LinearWarmupCosineAnnealingLR
 from metrics import auroc
-from utils import seed_all, AverageMeter, timeSince
+from utils import (
+    AverageMeter,
+    attach_patient_mean_predictions,
+    audit_laterality_label_mixes,
+    patient_level_aggregate,
+    seed_all,
+    timeSince,
+)
 
 
 def _fold_indices(args):
@@ -216,6 +223,7 @@ def do_experiments(args, device):
 
     args.df = pd.read_csv(csv_path)
     args.df = args.df.fillna(0)
+    audit_laterality_label_mixes(args.df, args.label, context="classifier input CSV")
     print(f"df shape: {args.df.shape}")
     print(args.df.columns)
 
@@ -281,13 +289,11 @@ def do_experiments(args, device):
 
         best_model_path = _best_model_path(args)
         if len(predict_df) > 0 and best_model_path.exists():
-            fold_predictions = predict_on_dataset(args, predict_df, best_model_path, device, fold)
-            fold_output = _build_fold_split_view(predict_df, fold, args.n_folds)
-            fold_output["prediction_prob"] = fold_predictions
-            fold_output["prediction_label"] = (fold_predictions >= 0.5).astype(int)
+            fold_output = predict_on_dataset(args, predict_df, best_model_path, device, fold)
+            fold_output = _build_fold_split_view(fold_output, fold, args.n_folds)
             fold_csv_path = args.output_path / f"fold{fold}_all_predictions.csv"
             fold_output.to_csv(fold_csv_path, index=False)
-            fold_prediction_arrays.append(fold_predictions)
+            fold_prediction_arrays.append(fold_output["prediction_prob"].values)
             print(f"Fold {fold} all-data predictions saved to: {fold_csv_path}")
 
     _save_eval_predictions(args, oof_df)
@@ -296,6 +302,7 @@ def do_experiments(args, device):
     if len(predict_df) > 0 and len(fold_prediction_arrays) > 0:
         ensemble_predictions = np.mean(fold_prediction_arrays, axis=0)
         ensemble_output = predict_df.copy()
+        ensemble_output["patient_prediction_prob"] = ensemble_predictions
         ensemble_output["prediction_prob"] = ensemble_predictions
         ensemble_output["prediction_label"] = (ensemble_predictions >= 0.5).astype(int)
         ensemble_csv_path = args.output_path / "ensemble_all_predictions.csv"
@@ -401,9 +408,8 @@ def train_loop(args, device):
         )
         args.valid_folds["prediction"] = predictions
 
-        valid_agg = args.valid_folds[["patient_id", args.label, "prediction", "fold"]].groupby(["patient_id"]).mean()
-
         if args.label.lower() in {"density", "birads"}:
+            valid_agg = args.valid_folds[["patient_id", args.label, "prediction", "fold"]].groupby(["patient_id"]).mean()
             correct_predictions = (valid_agg[args.label] == valid_agg["prediction"]).sum()
             total_predictions = len(valid_agg)
             accuracy = correct_predictions / total_predictions
@@ -445,6 +451,7 @@ def train_loop(args, device):
             else:
                 epochs_no_improve += 1
         else:
+            valid_agg = patient_level_aggregate(args.valid_folds, args.label, "prediction")
             aucroc_value = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction"].values)
             elapsed = time.time() - start_time
             print(
@@ -521,7 +528,7 @@ def inference_loop(args):
     print(f"predictions: {predictions.shape} {type(predictions)}")
     args.valid_folds["prediction"] = predictions
 
-    valid_agg = args.valid_folds[["patient_id", args.label, "prediction", "fold"]].groupby(["patient_id"]).mean()
+    valid_agg = patient_level_aggregate(args.valid_folds, args.label, "prediction")
     aucroc_value = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction"].values)
     print(f"Fold {args.cur_fold} AUC-ROC: {aucroc_value:.4f}")
     metrics_df = _save_fold_metrics(
@@ -588,10 +595,8 @@ def predict_on_dataset(args, df, model_path, device, fold):
 
     predictions = np.concatenate(preds)
 
-    predict_temp = df.copy()
-    predict_temp["prediction_prob"] = predictions
-    patient_pred = predict_temp.groupby("patient_id")["prediction_prob"].mean()
-    predictions_agg = df["patient_id"].map(patient_pred).values
+    predict_output = attach_patient_mean_predictions(df, predictions)
+    predictions_agg = predict_output["prediction_prob"].values
 
     print(
         f"Fold {fold} all-data prediction stats: mean={predictions_agg.mean():.4f}, "
@@ -600,7 +605,7 @@ def predict_on_dataset(args, df, model_path, device, fold):
 
     torch.cuda.empty_cache()
     gc.collect()
-    return predictions_agg
+    return predict_output
 
 
 def ensemble_predictions_for_dataset(args, df, best_model_paths, device):
@@ -609,8 +614,8 @@ def ensemble_predictions_for_dataset(args, df, best_model_paths, device):
     all_predictions = []
     for fold, model_path in enumerate(best_model_paths):
         if model_path.exists():
-            fold_preds = predict_on_dataset(args, df, model_path, device, fold)
-            all_predictions.append(fold_preds)
+            fold_output = predict_on_dataset(args, df, model_path, device, fold)
+            all_predictions.append(fold_output["prediction_prob"].values)
         else:
             print(f"Warning: Model not found: {model_path}")
 

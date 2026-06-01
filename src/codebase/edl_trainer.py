@@ -31,7 +31,14 @@ from Datasets.dataset_concepts import MammoDataset, collator_mammo_dataset_w_con
 from Datasets.dataset_utils import get_eval_transforms, get_transforms
 from breastclip.scheduler import LinearWarmupCosineAnnealingLR
 from metrics import auroc
-from utils import seed_all, AverageMeter, timeSince
+from utils import (
+    AverageMeter,
+    audit_laterality_label_mixes,
+    attach_patient_mean_predictions,
+    patient_level_aggregate,
+    seed_all,
+    timeSince,
+)
 
 
 def _amp_enabled(args, device):
@@ -329,6 +336,7 @@ def do_edl_experiments(args, device):
         csv_path = args.data_dir / csv_path
     args.df = pd.read_csv(csv_path)
     args.df = args.df.fillna(0)
+    audit_laterality_label_mixes(args.df, args.label, context="EDL input CSV")
     print(f"df shape: {args.df.shape}")
     print(args.df.columns)
 
@@ -393,10 +401,7 @@ def do_edl_experiments(args, device):
     if args.n_folds > 0 and len(oof_df) > 0:
         oof_df = oof_df.reset_index(drop=True)
         print('\n================ CV (Out-of-Fold) ================')
-        oof_agg = oof_df.groupby('patient_id').agg({
-            args.label: 'max',
-            'prediction_prob': 'mean'
-        }).reset_index()
+        oof_agg = patient_level_aggregate(oof_df, args.label, 'prediction_prob')
         aucroc_val = auroc(gt=oof_agg[args.label].values.astype(int), pred=oof_agg['prediction_prob'].values)
         print(f'OOF AUC-ROC: {aucroc_val:.4f}')
         oof_df.to_csv(args.output_path / f'edl_seed_{args.seed}_n_folds_{args.n_folds}_oof_outputs.csv', index=False)
@@ -411,9 +416,15 @@ def do_edl_experiments(args, device):
         all_alpha_cols = [f'alpha_{i}' for i in range(args.num_classes)]
         all_prob_cols = [f'probability_{i}' for i in range(args.num_classes)]
 
-        for col in all_evidence_cols + all_alpha_cols + all_prob_cols + ['total_uncertainty', 'prediction_prob']:
+        image_score_col = 'image_prediction_prob'
+        for col in all_evidence_cols + all_alpha_cols + all_prob_cols + ['total_uncertainty', image_score_col]:
             ensemble_output[col] = np.mean([fd[col].values for fd in fold_prediction_arrays], axis=0)
 
+        ensemble_output = attach_patient_mean_predictions(
+            ensemble_output,
+            ensemble_output[image_score_col].values,
+            image_score_col=image_score_col,
+        )
         ensemble_output['prediction_label'] = (ensemble_output['prediction_prob'] >= 0.5).astype(int)
         ensemble_csv_path = args.output_path / 'edl_ensemble_all_predictions.csv'
         ensemble_output['model_fold'] = 'ensemble'
@@ -517,10 +528,13 @@ def edl_train_loop(args, device):
         avg_val_loss, predictions = edl_valid_fn(
             valid_loader, model, criterion, args, device, epoch, logger=logger
         )
-        args.valid_folds['prediction_prob'] = predictions
+        args.valid_folds = attach_patient_mean_predictions(
+            args.valid_folds,
+            predictions,
+            image_score_col='image_prediction_prob',
+        )
 
-        valid_agg = args.valid_folds[['patient_id', args.label, 'prediction_prob', 'fold']].groupby(
-            ['patient_id']).mean()
+        valid_agg = patient_level_aggregate(args.valid_folds, args.label, 'prediction_prob')
         aucroc_val = auroc(valid_agg[args.label].values.astype(int), valid_agg['prediction_prob'].values)
         elapsed = time.time() - start_time
 
@@ -574,7 +588,11 @@ def edl_train_loop(args, device):
     best_model_path = _fold_best_model_path(args)
     if best_model_path.exists():
         predictions = torch.load(best_model_path, map_location='cpu', weights_only=False)['predictions']
-        args.valid_folds['prediction_prob'] = predictions
+        args.valid_folds = attach_patient_mean_predictions(
+            args.valid_folds,
+            predictions,
+            image_score_col='image_prediction_prob',
+        )
     else:
         print(f"Warning: No best model checkpoint found at {best_model_path}")
 
@@ -700,8 +718,11 @@ def edl_predict_on_dataset(args, df, model_path, device, fold):
 
     result_df['total_uncertainty'] = uncertainty_array.flatten()
     # 正类概率（类�?），兼容原有格式
-    result_df['prediction_prob'] = probs_array[:, -1]
-    result_df['prediction_label'] = (result_df['prediction_prob'] >= 0.5).astype(int)
+    result_df = attach_patient_mean_predictions(
+        result_df,
+        probs_array[:, -1],
+        image_score_col='image_prediction_prob',
+    )
 
     print(f"Fold {fold} prediction stats: "
           f"prob_mean={result_df['prediction_prob'].mean():.4f}, "

@@ -12,7 +12,7 @@ import pandas as pd
 import torch
 
 from Classifiers.experiments import do_experiments
-from utils import get_Paths, seed_all
+from utils import append_run_id, get_Paths, seed_all
 
 warnings.filterwarnings("ignore")
 
@@ -75,6 +75,7 @@ def config():
     parser.add_argument("--weighted-BCE", default="n", type=str, help="Use weighted BCE loss (y/n)")
     parser.add_argument("--patience", default=10, type=int, help="Early stopping patience (0=disabled)")
     parser.add_argument("--balanced-dataloader", default="n", type=str, help="Use balanced dataloader (y/n)")
+    parser.add_argument("--run-id", default=None, help="Run identifier appended to output/checkpoint/log directories.")
 
     return parser.parse_args()
 
@@ -83,7 +84,8 @@ def main(args):
     seed_all(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    args.root = f"lr_{args.lr}_epochs_{args.epochs}_weighted_BCE_{args.weighted_BCE}_{args.label}_data_frac_{args.data_frac}"
+    base_root = f"lr_{args.lr}_epochs_{args.epochs}_weighted_BCE_{args.weighted_BCE}_{args.label}_data_frac_{args.data_frac}"
+    args.root, args.run_id = append_run_id(base_root, getattr(args, "run_id", None))
     args.apex = args.apex == "y"
     args.pretrained_swin_encoder = args.pretrained_swin_encoder == "y"
     args.swin_model_type = args.swin_model_type == "y"
@@ -98,6 +100,7 @@ def main(args):
     os.makedirs(output_path, exist_ok=True)
     os.makedirs(tb_logs_path, exist_ok=True)
     print("====================> Paths <====================")
+    print(f"run_id: {args.run_id}")
     print(f"checkpoint_path: {chk_pt_path}")
     print(f"output_path: {output_path}")
     print(f"tb_logs_path: {tb_logs_path}")
