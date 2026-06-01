@@ -76,6 +76,7 @@ EDL_PROTO_INIT = "kmeans"
 EDL_PROTO_ATTRACT_WEIGHT = 0.1
 EDL_PROTO_SEPARATION_WEIGHT = 0.1
 EDL_PROTO_DIVERSITY_WEIGHT = 0.01
+EDL_PROTO_LOSS_WEIGHT = 1.0
 EDL_PROTO_MARGIN = 1.0
 EDL_PROTO_BALANCE_CLASSES = "y"
 
@@ -224,6 +225,14 @@ def build_parser():
         help="Weight for keeping prototypes within each class separated.",
     )
     parser.add_argument(
+        "--edl-proto-loss-weight",
+        "--edl_proto_loss_weight",
+        dest="edl_proto_loss_weight",
+        type=float,
+        default=EDL_PROTO_LOSS_WEIGHT,
+        help="Global multiplier for the combined prototype regularization loss.",
+    )
+    parser.add_argument(
         "--edl-proto-margin",
         "--edl_proto_margin",
         dest="edl_proto_margin",
@@ -265,6 +274,7 @@ def main():
         "edl_proto_attract_weight",
         "edl_proto_separation_weight",
         "edl_proto_diversity_weight",
+        "edl_proto_loss_weight",
     ):
         if getattr(cli_args, loss_name) < 0:
             raise ValueError(f"--{loss_name.replace('_', '-')} must be non-negative.")
@@ -406,15 +416,20 @@ def main():
     args.edl_proto_attract_weight = cli_args.edl_proto_attract_weight
     args.edl_proto_separation_weight = cli_args.edl_proto_separation_weight
     args.edl_proto_diversity_weight = cli_args.edl_proto_diversity_weight
+    args.edl_proto_loss_weight = cli_args.edl_proto_loss_weight
     args.edl_proto_margin = cli_args.edl_proto_margin
     args.edl_proto_balance_classes = cli_args.edl_proto_balance_classes == "y"
 
     seed_all(args.seed)
 
+    proto_loss_weight_suffix = ""
+    if abs(args.edl_proto_loss_weight - EDL_PROTO_LOSS_WEIGHT) > 1e-12:
+        proto_loss_weight_suffix = f"_proto_w{args.edl_proto_loss_weight}"
+
     base_root = (
         f"lr_{args.lr}_epochs_{args.epochs}_prototype_edl_{args.edl_loss_type}_{args.label}_"
         f"k_{args.edl_proto_k}_proto_a{args.edl_proto_attract_weight}_"
-        f"s{args.edl_proto_separation_weight}_d{args.edl_proto_diversity_weight}_"
+        f"s{args.edl_proto_separation_weight}_d{args.edl_proto_diversity_weight}{proto_loss_weight_suffix}_"
         f"m{args.edl_proto_margin}_bal_{'y' if args.edl_proto_balance_classes else 'n'}_mode_{args.train_mode}"
     )
     args.root, args.run_id = append_run_id(base_root, cli_args.run_id)
@@ -452,6 +467,7 @@ def main():
     print(f"edl_proto_attract_weight: {args.edl_proto_attract_weight}")
     print(f"edl_proto_separation_weight: {args.edl_proto_separation_weight}")
     print(f"edl_proto_diversity_weight: {args.edl_proto_diversity_weight}")
+    print(f"edl_proto_loss_weight: {args.edl_proto_loss_weight}")
     print(f"edl_proto_margin: {args.edl_proto_margin}")
     print(f"edl_proto_balance_classes: {args.edl_proto_balance_classes}")
     print(f"train_mode: {args.train_mode}")

@@ -115,7 +115,7 @@ KMeans 只是 prototype 的初始化方式，训练时 prototype 仍然是可学
 Prototype + EDL 路径默认增加三类 prototype 正则，只作用于 `edl_proto_train.py`，不会影响原 EDL baseline：
 
 ```text
-total_loss = EDLCombinedLoss + prototype_regularization
+total_loss = EDLCombinedLoss + edl_proto_loss_weight * prototype_regularization_raw
 ```
 
 正则项包括：
@@ -130,13 +130,16 @@ total_loss = EDLCombinedLoss + prototype_regularization
 --edl_proto_attract_weight      default 0.1
 --edl_proto_separation_weight   default 0.1
 --edl_proto_diversity_weight    default 0.01
+--edl_proto_loss_weight         default 1.0
 --edl_proto_margin              default 1.0
 --edl_proto_balance_classes     default y
 ```
 
 `--edl_proto_balance_classes y` 表示 attraction / separation 先在 batch 内按类别分别求均值，再对出现的类别平均。这个设置对阳性样本极少的任务很重要，可以避免 prototype 正则几乎完全被 negative class 主导。
 
-如果想先观察纯 Prototype + EDL head 的效果，可以把三个 weight 都设为 `0`。如果 prototype 解释性弱或出现塌缩，可以优先提高 `--edl_proto_diversity_weight` 或 `--edl_proto_separation_weight`。
+`--edl_proto_loss_weight 1.0` 保持旧训练行为不变。若日志里 `proto` 明显小于 `edl`，建议先把总权重设为 `3.0`，仍偏弱再试 `5.0`；之后再按现象微调三项分项权重。日志中的 `proto` 是实际进入总 loss 的加权值，`proto_raw` 是乘总权重前的原始 prototype regularization。
+
+如果想先观察纯 Prototype + EDL head 的效果，可以把三个分项 weight 或总权重设为 `0`。如果 prototype 解释性弱或出现塌缩，在总权重合适后再优先提高 `--edl_proto_diversity_weight` 或 `--edl_proto_separation_weight`。
 
 ## 当前项目用法
 
@@ -158,6 +161,7 @@ python edl_proto_train.py \
   --edl_proto_attract_weight 0.1 \
   --edl_proto_separation_weight 0.1 \
   --edl_proto_diversity_weight 0.01 \
+  --edl_proto_loss_weight 3.0 \
   --edl_proto_margin 1.0 \
   --edl_proto_balance_classes y
 ```

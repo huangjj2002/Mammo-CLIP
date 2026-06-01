@@ -58,6 +58,7 @@ from utils import (
 PROTO_HISTORY_KEYS = (
     "train_edl_loss",
     "train_proto_loss",
+    "train_proto_loss_raw",
     "train_proto_attract_loss",
     "train_proto_separation_loss",
     "train_proto_diversity_loss",
@@ -138,6 +139,7 @@ def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best
         "edl_proto_attract_weight": getattr(args, "edl_proto_attract_weight", None),
         "edl_proto_separation_weight": getattr(args, "edl_proto_separation_weight", None),
         "edl_proto_diversity_weight": getattr(args, "edl_proto_diversity_weight", None),
+        "edl_proto_loss_weight": getattr(args, "edl_proto_loss_weight", 1.0),
         "edl_proto_margin": getattr(args, "edl_proto_margin", None),
         "edl_proto_balance_classes": getattr(args, "edl_proto_balance_classes", None),
     }
@@ -185,6 +187,7 @@ def _save_fold_metrics_csv(args, history, eval_split):
         "eval_loss": history["valid_loss"],
         "eval_aucroc": history["valid_aucroc"],
         "eval_split": [eval_split] * len(history["epochs"]),
+        "edl_proto_loss_weight": [getattr(args, "edl_proto_loss_weight", 1.0)] * len(history["epochs"]),
     }
     for key in PROTO_HISTORY_KEYS:
         values = history.get(key, [])
@@ -307,13 +310,16 @@ def _compute_prototype_regularization(model, details, labels, args):
     attract_weight = float(getattr(args, "edl_proto_attract_weight", 0.0))
     separation_weight = float(getattr(args, "edl_proto_separation_weight", 0.0))
     diversity_weight = float(getattr(args, "edl_proto_diversity_weight", 0.0))
-    proto_loss = (
+    proto_loss_weight = float(getattr(args, "edl_proto_loss_weight", 1.0))
+    proto_loss_raw = (
         attract_weight * attract_loss
         + separation_weight * separation_loss
         + diversity_weight * diversity_loss
     )
+    proto_loss = proto_loss_weight * proto_loss_raw
     stats = {
         "prototype_loss": proto_loss.detach(),
+        "prototype_loss_raw": proto_loss_raw.detach(),
         "attract_loss": attract_loss.detach(),
         "separation_loss": separation_loss.detach(),
         "diversity_loss": diversity_loss.detach(),
@@ -328,6 +334,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
     losses = AverageMeter()
     edl_losses = AverageMeter()
     proto_losses = AverageMeter()
+    proto_raw_losses = AverageMeter()
     attract_losses = AverageMeter()
     separation_losses = AverageMeter()
     diversity_losses = AverageMeter()
@@ -389,6 +396,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
         losses.update(float(loss.item()), batch_size)
         edl_losses.update(float(edl_loss.item()), batch_size)
         proto_losses.update(float(proto_loss.item()), batch_size)
+        proto_raw_losses.update(float(proto_stats["prototype_loss_raw"].item()), batch_size)
         attract_losses.update(float(proto_stats["attract_loss"].item()), batch_size)
         separation_losses.update(float(proto_stats["separation_loss"].item()), batch_size)
         diversity_losses.update(float(proto_stats["diversity_loss"].item()), batch_size)
@@ -404,6 +412,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
             "loss": f"{losses.avg:.4f}",
             "edl": f"{edl_losses.avg:.4f}",
             "proto": f"{proto_losses.avg:.4f}",
+            "proto_raw": f"{proto_raw_losses.avg:.4f}",
             "skipped": skipped_batches,
         }
         postfix.update(_cuda_postfix(device))
@@ -414,7 +423,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
                 "Epoch: [{0}][{1}/{2}] "
                 "Elapsed {remain:s} "
                 "Loss: {loss.val:.4f}({loss.avg:.4f}) "
-                "EDL: {edl.avg:.4f} Proto: {proto.avg:.4f} "
+                "EDL: {edl.avg:.4f} Proto: {proto.avg:.4f} ProtoRaw: {proto_raw.avg:.4f} "
                 "LR: {lr:.8f}".format(
                     epoch + 1,
                     step,
@@ -423,6 +432,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
                     loss=losses,
                     edl=edl_losses,
                     proto=proto_losses,
+                    proto_raw=proto_raw_losses,
                     lr=optimizer.param_groups[0]["lr"],
                 )
             )
@@ -433,6 +443,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
             logger.add_scalar("train/iter_loss", losses.avg, index)
             logger.add_scalar("train/iter_edl_loss", edl_losses.avg, index)
             logger.add_scalar("train/iter_proto_loss", proto_losses.avg, index)
+            logger.add_scalar("train/iter_proto_loss_raw", proto_raw_losses.avg, index)
             logger.add_scalar("train/iter_proto_attract_loss", attract_losses.avg, index)
             logger.add_scalar("train/iter_proto_separation_loss", separation_losses.avg, index)
             logger.add_scalar("train/iter_proto_diversity_loss", diversity_losses.avg, index)
@@ -445,6 +456,7 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
     stats = {
         "edl_loss": edl_losses.avg,
         "prototype_loss": proto_losses.avg,
+        "prototype_loss_raw": proto_raw_losses.avg,
         "attract_loss": attract_losses.avg,
         "separation_loss": separation_losses.avg,
         "diversity_loss": diversity_losses.avg,
@@ -659,6 +671,8 @@ def do_prototype_edl_experiments(args, device):
 
 def prototype_edl_train_loop(args, device):
     print(f"\n================== Prototype EDL fold: {args.cur_fold} training ======================")
+    if not hasattr(args, "edl_proto_loss_weight"):
+        args.edl_proto_loss_weight = 1.0
 
     ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
     if ckpt["config"]["model"]["image_encoder"]["model_type"] == "swin":
@@ -739,12 +753,15 @@ def prototype_edl_train_loop(args, device):
 
         print(
             f"Epoch {epoch + 1} - avg_train_loss: {avg_loss:.4f}  avg_{eval_name}_loss: {avg_val_loss:.4f}  "
-            f"proto_loss: {train_loss_stats['prototype_loss']:.4f}  AUC-ROC: {aucroc_val:.4f}  time: {elapsed:.0f}s"
+            f"proto_loss: {train_loss_stats['prototype_loss']:.4f}  "
+            f"proto_raw: {train_loss_stats['prototype_loss_raw']:.4f}  AUC-ROC: {aucroc_val:.4f}  time: {elapsed:.0f}s"
         )
         logger.add_scalar(f"{eval_name}/{args.label}/AUC-ROC", aucroc_val, epoch + 1)
         logger.add_scalar("train/epoch_loss", avg_loss, epoch + 1)
         logger.add_scalar("train/epoch_edl_loss", train_loss_stats["edl_loss"], epoch + 1)
         logger.add_scalar("train/epoch_proto_loss", train_loss_stats["prototype_loss"], epoch + 1)
+        logger.add_scalar("train/epoch_proto_loss_raw", train_loss_stats["prototype_loss_raw"], epoch + 1)
+        logger.add_scalar("train/edl_proto_loss_weight", args.edl_proto_loss_weight, epoch + 1)
         logger.add_scalar("train/epoch_proto_attract_loss", train_loss_stats["attract_loss"], epoch + 1)
         logger.add_scalar("train/epoch_proto_separation_loss", train_loss_stats["separation_loss"], epoch + 1)
         logger.add_scalar("train/epoch_proto_diversity_loss", train_loss_stats["diversity_loss"], epoch + 1)
@@ -754,6 +771,7 @@ def prototype_edl_train_loop(args, device):
         history["train_loss"].append(avg_loss)
         history["train_edl_loss"].append(train_loss_stats["edl_loss"])
         history["train_proto_loss"].append(train_loss_stats["prototype_loss"])
+        history["train_proto_loss_raw"].append(train_loss_stats["prototype_loss_raw"])
         history["train_proto_attract_loss"].append(train_loss_stats["attract_loss"])
         history["train_proto_separation_loss"].append(train_loss_stats["separation_loss"])
         history["train_proto_diversity_loss"].append(train_loss_stats["diversity_loss"])
@@ -784,6 +802,7 @@ def prototype_edl_train_loop(args, device):
                     "edl_proto_attract_weight": args.edl_proto_attract_weight,
                     "edl_proto_separation_weight": args.edl_proto_separation_weight,
                     "edl_proto_diversity_weight": args.edl_proto_diversity_weight,
+                    "edl_proto_loss_weight": args.edl_proto_loss_weight,
                     "edl_proto_margin": args.edl_proto_margin,
                     "edl_proto_balance_classes": args.edl_proto_balance_classes,
                 },
