@@ -9,6 +9,7 @@ Evidential Deep Learning (EDL) 训练/验证/测试模块
 """
 
 import gc
+import json
 import math
 import time
 from pathlib import Path
@@ -158,6 +159,259 @@ def _placeholder_prediction_batch(args, batch_size):
     return evidence, probs, uncertainty
 
 
+def _weighted_bce_enabled(args):
+    return str(getattr(args, "weighted_BCE", "n")).strip().lower() == "y"
+
+
+def _json_safe(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        value = float(value)
+        return value if np.isfinite(value) else None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_safe(val) for key, val in value.items()}
+    return value
+
+
+def _class_count_summary(df, label_col):
+    if df is None:
+        return {"total": 0, "positive": 0, "negative": 0, "missing_label": 0}
+    if label_col not in df.columns:
+        return {"total": int(len(df)), "positive": 0, "negative": 0, "missing_label": int(len(df))}
+    labels = pd.to_numeric(df[label_col], errors="coerce")
+    return {
+        "total": int(len(df)),
+        "positive": int((labels == 1).sum()),
+        "negative": int((labels == 0).sum()),
+        "missing_label": int(labels.isna().sum()),
+    }
+
+
+def _edl_run_config_path(args):
+    return args.output_path / "edl_run_config.json"
+
+
+def _read_existing_run_config(args):
+    path = _edl_run_config_path(args)
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
+    args.output_path.mkdir(parents=True, exist_ok=True)
+    config = _read_existing_run_config(args)
+    tracked_args = [
+        "dataset",
+        "model_type",
+        "arch",
+        "root",
+        "run_id",
+        "seed",
+        "n_folds",
+        "epochs",
+        "batch_size",
+        "lr",
+        "weight_decay",
+        "weighted_BCE",
+        "train_mode",
+        "freeze_backbone",
+        "edl_loss_type",
+        "edl_kl_weight",
+        "edl_annealing_start",
+        "edl_annealing_epochs",
+        "edl_dropout",
+        "edl_hidden_dim",
+        "num_classes",
+        "label",
+        "patience",
+        "skip_bad_batches",
+    ]
+    config.update(
+        {
+            "module": "EDL",
+            "weighted_BCE_enabled": _weighted_bce_enabled(args),
+            "csv_file": str(getattr(args, "_resolved_csv_path", getattr(args, "csv_file", ""))),
+            "data_dir": str(getattr(args, "data_dir", "")),
+            "img_dir": str(getattr(args, "img_dir", "")),
+            "clip_chk_pt_path": str(getattr(args, "clip_chk_pt_path", "")),
+            "output_path": str(getattr(args, "output_path", "")),
+            "chk_pt_path": str(getattr(args, "chk_pt_path", "")),
+            "tb_logs_path": str(getattr(args, "tb_logs_path", "")),
+            "args": {name: getattr(args, name, None) for name in tracked_args},
+        }
+    )
+    if split_summary is not None:
+        config["split_summary"] = split_summary
+    if fold_diagnostic is not None:
+        existing = {
+            str(item.get("fold")): item
+            for item in config.get("fold_diagnostics", [])
+            if isinstance(item, dict)
+        }
+        existing[str(fold_diagnostic.get("fold"))] = fold_diagnostic
+        config["fold_diagnostics"] = [
+            existing[key] for key in sorted(existing, key=lambda item: int(item) if str(item).lstrip("-").isdigit() else str(item))
+        ]
+
+    path = _edl_run_config_path(args)
+    path.write_text(json.dumps(_json_safe(config), ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _loss_component_meters():
+    return {
+        "data_loss": AverageMeter(),
+        "unweighted_data_loss": AverageMeter(),
+        "kl_loss": AverageMeter(),
+        "total_loss": AverageMeter(),
+        "annealing_coef": AverageMeter(),
+    }
+
+
+def _update_loss_component_meters(meters, criterion, batch_size):
+    attr_map = {
+        "data_loss": "last_data_loss",
+        "unweighted_data_loss": "last_unweighted_data_loss",
+        "kl_loss": "last_kl_loss",
+        "total_loss": "last_total_loss",
+        "annealing_coef": "last_annealing_coef",
+    }
+    for key, attr in attr_map.items():
+        value = getattr(criterion, attr, None)
+        if value is not None and np.isfinite(float(value)):
+            meters[key].update(float(value), batch_size)
+
+
+def _loss_component_summary(losses, meters, skipped_batches=0):
+    stats = {"loss": float(losses.avg), "skipped_batches": int(skipped_batches)}
+    for key, meter in meters.items():
+        stats[key] = float(meter.avg) if meter.count else float("nan")
+    return stats
+
+
+def _safe_div(num, den):
+    return float(num / den) if den else 0.0
+
+
+def _safe_auroc(labels, scores):
+    labels = np.asarray(labels).astype(int)
+    scores = np.asarray(scores).astype(float)
+    if len(np.unique(labels)) < 2:
+        return float("nan")
+    try:
+        return float(auroc(labels, scores))
+    except Exception:
+        return float("nan")
+
+
+def _score_quantiles(values):
+    values = pd.to_numeric(pd.Series(values), errors="coerce")
+    values = values[np.isfinite(values)]
+    if values.empty:
+        return {
+            "score_min": float("nan"),
+            "score_q10": float("nan"),
+            "score_q25": float("nan"),
+            "score_q50": float("nan"),
+            "score_q75": float("nan"),
+            "score_q90": float("nan"),
+            "score_q95": float("nan"),
+            "score_max": float("nan"),
+            "score_mean": float("nan"),
+        }
+    return {
+        "score_min": float(values.min()),
+        "score_q10": float(values.quantile(0.10)),
+        "score_q25": float(values.quantile(0.25)),
+        "score_q50": float(values.quantile(0.50)),
+        "score_q75": float(values.quantile(0.75)),
+        "score_q90": float(values.quantile(0.90)),
+        "score_q95": float(values.quantile(0.95)),
+        "score_max": float(values.max()),
+        "score_mean": float(values.mean()),
+    }
+
+
+def _threshold_diagnostics(df, label_col, score_col, prefix, threshold=0.5):
+    if df.empty or label_col not in df.columns or score_col not in df.columns:
+        return {
+            f"{prefix}_sample_n": int(len(df)),
+            f"{prefix}_positive_n": 0,
+            f"{prefix}_negative_n": 0,
+            f"{prefix}_aucroc": float("nan"),
+            f"{prefix}_pred_pos_at_0_5": 0,
+        }
+    labels = pd.to_numeric(df[label_col], errors="coerce")
+    scores = pd.to_numeric(df[score_col], errors="coerce")
+    valid_mask = labels.notna() & scores.notna() & np.isfinite(scores)
+    labels = labels.loc[valid_mask].astype(int).to_numpy()
+    scores = scores.loc[valid_mask].astype(float).to_numpy()
+    preds = (scores >= threshold).astype(int)
+    tp = int(((labels == 1) & (preds == 1)).sum())
+    tn = int(((labels == 0) & (preds == 0)).sum())
+    fp = int(((labels == 0) & (preds == 1)).sum())
+    fn = int(((labels == 1) & (preds == 0)).sum())
+    sensitivity = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
+    out = {
+        f"{prefix}_sample_n": int(len(labels)),
+        f"{prefix}_positive_n": int((labels == 1).sum()),
+        f"{prefix}_negative_n": int((labels == 0).sum()),
+        f"{prefix}_aucroc": _safe_auroc(labels, scores),
+        f"{prefix}_bacc_at_0_5": (sensitivity + specificity) / 2.0,
+        f"{prefix}_sensitivity_at_0_5": sensitivity,
+        f"{prefix}_specificity_at_0_5": specificity,
+        f"{prefix}_ppv_at_0_5": _safe_div(tp, tp + fp),
+        f"{prefix}_npv_at_0_5": _safe_div(tn, tn + fn),
+        f"{prefix}_tp_at_0_5": tp,
+        f"{prefix}_tn_at_0_5": tn,
+        f"{prefix}_fp_at_0_5": fp,
+        f"{prefix}_fn_at_0_5": fn,
+        f"{prefix}_pred_pos_at_0_5": int(preds.sum()),
+        f"{prefix}_pred_neg_at_0_5": int(len(preds) - preds.sum()),
+    }
+    for key, value in _score_quantiles(scores).items():
+        out[f"{prefix}_{key}"] = value
+    for name, mask in [("pos", labels == 1), ("neg", labels == 0)]:
+        for key, value in _score_quantiles(scores[mask]).items():
+            out[f"{prefix}_{name}_{key}"] = value
+    return out
+
+
+def _append_epoch_history(history, epoch, values):
+    old_len = len(history.get("epochs", []))
+    history.setdefault("epochs", []).append(epoch)
+    for key, existing in list(history.items()):
+        if key == "epochs" or not isinstance(existing, list):
+            continue
+        while len(existing) < old_len:
+            existing.append(float("nan"))
+        if key not in values and len(existing) == old_len:
+            existing.append(float("nan"))
+    for key, value in values.items():
+        if key not in history:
+            history[key] = [float("nan")] * old_len
+        history[key].append(value)
+
+
+def _history_column(history, key, length):
+    values = list(history.get(key, []))
+    if len(values) < length:
+        values.extend([float("nan")] * (length - len(values)))
+    return values[:length]
+
+
 def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler):
     start_epoch = 0
     best_aucroc = 0.0
@@ -293,15 +547,20 @@ def _metrics_csv_path(args):
 
 
 def _save_fold_metrics_csv(args, history, eval_split):
-    metrics_df = pd.DataFrame(
-        {
-            "epoch": history["epochs"],
-            "train_loss": history["train_loss"],
-            "eval_loss": history["valid_loss"],
-            "eval_aucroc": history["valid_aucroc"],
-            "eval_split": [eval_split] * len(history["epochs"]),
-        }
-    )
+    length = len(history.get("epochs", []))
+    metrics_data = {
+        "epoch": _history_column(history, "epochs", length),
+        "train_loss": _history_column(history, "train_loss", length),
+        "eval_loss": _history_column(history, "valid_loss", length),
+        "eval_aucroc": _history_column(history, "valid_aucroc", length),
+        "eval_split": [eval_split] * length,
+    }
+    reserved = {"epochs", "train_loss", "valid_loss", "valid_aucroc"}
+    for key in sorted(history):
+        if key in reserved or not isinstance(history[key], list):
+            continue
+        metrics_data[key] = _history_column(history, key, length)
+    metrics_df = pd.DataFrame(metrics_data)
     metrics_df.to_csv(_metrics_csv_path(args), index=False)
     print(f"Fold {args.cur_fold} metrics saved to: {_metrics_csv_path(args)}")
     return metrics_df
@@ -334,6 +593,7 @@ def do_edl_experiments(args, device):
     csv_path = Path(args.csv_file)
     if not csv_path.is_absolute():
         csv_path = args.data_dir / csv_path
+    args._resolved_csv_path = csv_path
     args.df = pd.read_csv(csv_path)
     args.df = args.df.fillna(0)
     audit_laterality_label_mixes(args.df, args.label, context="EDL input CSV")
@@ -357,6 +617,15 @@ def do_edl_experiments(args, device):
         print(f"Holdout val samples: {len(holdout_val_df)}")
     print(f"Test samples: {len(test_df)}")
     print(f"Prediction output samples (all rows): {len(predict_df)}")
+    args._edl_split_summary = {
+        "train_pool": _class_count_summary(train_df, args.label),
+        "holdout_train": _class_count_summary(holdout_train_df, args.label),
+        "holdout_val": _class_count_summary(holdout_val_df, args.label),
+        "test": _class_count_summary(test_df, args.label),
+        "predict_all": _class_count_summary(predict_df, args.label),
+    }
+    config_path = _write_edl_run_config(args, split_summary=args._edl_split_summary)
+    print(f"EDL run config saved to: {config_path}")
 
     if args.n_folds == 0 and len(holdout_val_df) == 0 and len(test_df) == 0:
         raise ValueError("n_folds=0 requires a non-empty validation split or test split for per-epoch evaluation.")
@@ -497,6 +766,28 @@ def edl_train_loop(args, device):
 
     logger = SummaryWriter(args.tb_logs_path / f'edl_fold{args.cur_fold}')
     class_weights = _compute_fold_class_weights(args)
+    if _weighted_bce_enabled(args) and class_weights is None:
+        raise ValueError(
+            f"weighted_BCE=y but class_weights could not be computed for fold {args.cur_fold}. "
+            "Check train_folds labels before training."
+        )
+    _write_edl_run_config(
+        args,
+        split_summary=getattr(args, "_edl_split_summary", None),
+        fold_diagnostic={
+            "fold": int(args.cur_fold),
+            "eval_split": getattr(args, "eval_split", "val"),
+            "train_counts": _class_count_summary(args.train_folds, args.label),
+            "eval_counts": _class_count_summary(args.valid_folds, args.label),
+            "weighted_BCE_enabled": _weighted_bce_enabled(args),
+            "class_weights": class_weights,
+            "class_weight_negative": class_weights[0] if class_weights is not None else None,
+            "class_weight_positive": class_weights[1] if class_weights is not None and len(class_weights) > 1 else None,
+            "best_checkpoint_path": str(_fold_best_model_path(args)),
+            "last_checkpoint_path": str(_fold_last_checkpoint_path(args)),
+            "metrics_csv": str(_metrics_csv_path(args)),
+        },
+    )
     criterion = EDLLoss(
         num_classes=num_classes,
         loss_type=args.edl_loss_type,
@@ -521,13 +812,15 @@ def edl_train_loop(args, device):
                 f"{_edl_annealing_gate_visible_epoch(args)} while EDL annealing is active."
             )
 
-        avg_loss = edl_train_fn(
+        train_stats = edl_train_fn(
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, logger, device
         )
+        avg_loss = train_stats["loss"]
 
-        avg_val_loss, predictions = edl_valid_fn(
+        valid_stats, predictions = edl_valid_fn(
             valid_loader, model, criterion, args, device, epoch, logger=logger
         )
+        avg_val_loss = valid_stats["loss"]
         args.valid_folds = attach_patient_mean_predictions(
             args.valid_folds,
             predictions,
@@ -536,20 +829,49 @@ def edl_train_loop(args, device):
 
         valid_agg = patient_level_aggregate(args.valid_folds, args.label, 'prediction_prob')
         aucroc_val = auroc(valid_agg[args.label].values.astype(int), valid_agg['prediction_prob'].values)
+        patient_diag = _threshold_diagnostics(valid_agg, args.label, "prediction_prob", "eval_patient")
+        image_diag = _threshold_diagnostics(args.valid_folds, args.label, "image_prediction_prob", "eval_image")
         elapsed = time.time() - start_time
 
         print(
             f'Epoch {epoch + 1} - avg_train_loss: {avg_loss:.4f}  avg_{eval_name}_loss: {avg_val_loss:.4f}  '
-            f'AUC-ROC: {aucroc_val:.4f}  time: {elapsed:.0f}s'
+            f'AUC-ROC: {aucroc_val:.4f}  '
+            f"BACC@0.5: {patient_diag['eval_patient_bacc_at_0_5']:.4f}  "
+            f"Pred_Pos@0.5: {patient_diag['eval_patient_pred_pos_at_0_5']}  "
+            f'time: {elapsed:.0f}s'
         )
         logger.add_scalar(f'{eval_name}/{args.label}/AUC-ROC', aucroc_val, epoch + 1)
+        logger.add_scalar(f'{eval_name}/{args.label}/BACC@0.5', patient_diag['eval_patient_bacc_at_0_5'], epoch + 1)
+        logger.add_scalar(f'{eval_name}/{args.label}/Pred_Pos@0.5', patient_diag['eval_patient_pred_pos_at_0_5'], epoch + 1)
         logger.add_scalar('train/epoch_loss', avg_loss, epoch + 1)
         logger.add_scalar('valid/epoch_loss', avg_val_loss, epoch + 1)
+        logger.add_scalar('train/data_loss', train_stats["data_loss"], epoch + 1)
+        logger.add_scalar('train/unweighted_data_loss', train_stats["unweighted_data_loss"], epoch + 1)
+        logger.add_scalar('train/kl_loss', train_stats["kl_loss"], epoch + 1)
+        logger.add_scalar('valid/data_loss', valid_stats["data_loss"], epoch + 1)
+        logger.add_scalar('valid/unweighted_data_loss', valid_stats["unweighted_data_loss"], epoch + 1)
+        logger.add_scalar('valid/kl_loss', valid_stats["kl_loss"], epoch + 1)
 
-        history['epochs'].append(epoch + 1)
-        history['train_loss'].append(avg_loss)
-        history['valid_loss'].append(avg_val_loss)
-        history['valid_aucroc'].append(aucroc_val)
+        history_values = {
+            "train_loss": avg_loss,
+            "valid_loss": avg_val_loss,
+            "valid_aucroc": aucroc_val,
+            "train_data_loss": train_stats["data_loss"],
+            "train_unweighted_data_loss": train_stats["unweighted_data_loss"],
+            "train_kl_loss": train_stats["kl_loss"],
+            "train_total_loss": train_stats["total_loss"],
+            "train_annealing_coef": train_stats["annealing_coef"],
+            "train_skipped_batches": train_stats["skipped_batches"],
+            "eval_data_loss": valid_stats["data_loss"],
+            "eval_unweighted_data_loss": valid_stats["unweighted_data_loss"],
+            "eval_kl_loss": valid_stats["kl_loss"],
+            "eval_total_loss": valid_stats["total_loss"],
+            "eval_annealing_coef": valid_stats["annealing_coef"],
+            "eval_skipped_batches": valid_stats["skipped_batches"],
+        }
+        history_values.update(patient_diag)
+        history_values.update(image_diag)
+        _append_epoch_history(history, epoch + 1, history_values)
 
         if epoch == 0 or best_aucroc < aucroc_val:
             best_aucroc = aucroc_val
@@ -761,6 +1083,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     model.train()
     amp_enabled = scaler.is_enabled()
     losses = AverageMeter()
+    component_meters = _loss_component_meters()
     start = end = time.time()
     skipped_batches = 0
 
@@ -810,8 +1133,9 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
             _append_skip_log(args, "train_skip", epoch, step, data.get('img_path', []), "non-finite train loss")
             print(f"[WARN] Skipping train batch at epoch {epoch + 1} step {step}: non-finite train loss")
             continue
-
+
         losses.update(float(loss.item()), batch_size)
+        _update_loss_component_meters(component_meters, criterion, batch_size)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -848,14 +1172,16 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     if skipped_batches > 0:
         print(f"Epoch {epoch + 1}: skipped {skipped_batches} train batch(es).")
 
-    return losses.avg
+    return _loss_component_summary(losses, component_meters, skipped_batches)
 
 
-def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=None):
+def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=None):
     """EDL验证一个epoch"""
-    losses = AverageMeter()
+    losses = AverageMeter()
+    component_meters = _loss_component_meters()
     model.eval()
-    preds = []
+    preds = []
+    skipped_batches = 0
     start = time.time()
 
     progress_iter = tqdm(enumerate(valid_loader), desc=f"[{epoch + 1:03d}/{args.epochs:03d} epoch valid]",
@@ -871,6 +1197,7 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
             reason = fallback_errors[0] if fallback_errors else "fallback image used during validation"
             _append_skip_log(args, "valid_fallback", epoch, step, fallback_paths, reason)
             if data["x"].size(0) == 0:
+                skipped_batches += 1
                 preds.append(batch_pos_probs)
                 print(f"[WARN] Validation batch contains only fallback images at epoch {epoch + 1} step {step}: {reason}")
                 continue
@@ -888,6 +1215,7 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
         labels = data['y'].long().to(device)
 
         if not torch.isfinite(inputs).all():
+            skipped_batches += 1
             _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid inputs")
             print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid inputs")
             loss = torch.tensor(0.0)
@@ -900,6 +1228,7 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
 
             # 计算正类概率用于AUC-ROC评估
             if not torch.isfinite(evidence).all():
+                skipped_batches += 1
                 _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid evidence")
                 print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid evidence")
                 loss = torch.tensor(0.0)
@@ -907,6 +1236,7 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
                 preds.append(batch_pos_probs)
                 continue
             if not torch.isfinite(loss):
+                skipped_batches += 1
                 _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid loss")
                 print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid loss")
                 loss = torch.tensor(0.0)
@@ -915,6 +1245,7 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
                 continue
             probs = BreastClipEDLClassifier.compute_probabilities(evidence)
             if not torch.isfinite(probs).all():
+                skipped_batches += 1
                 _append_skip_log(args, "valid_skip", epoch, step, data.get('img_path', []), "non-finite valid probabilities")
                 print(f"[WARN] Recovering valid batch at epoch {epoch + 1} step {step}: non-finite valid probabilities")
                 loss = torch.tensor(0.0)
@@ -924,7 +1255,8 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
             # 取正类（类别1）的概率
             pos_probs = probs[:, -1].cpu().numpy()
 
-        losses.update(loss.item(), batch_size)
+        losses.update(loss.item(), batch_size)
+        _update_loss_component_meters(component_meters, criterion, batch_size)
         batch_pos_probs[valid_indices] = pos_probs
         preds.append(batch_pos_probs)
 
@@ -947,7 +1279,10 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
             logger.add_scalar('valid/iter_loss', losses.avg, index)
 
     predictions = np.concatenate(preds)
-    return losses.avg, predictions
+    if skipped_batches > 0:
+        print(f"Epoch {epoch + 1}: recovered {skipped_batches} valid batch(es).")
+
+    return _loss_component_summary(losses, component_meters, skipped_batches), predictions
 
 
 

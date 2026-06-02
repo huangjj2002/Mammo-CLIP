@@ -195,6 +195,13 @@ class EDLLoss(nn.Module):
                     f"class_weights length {class_weights.numel()} does not match num_classes={num_classes}"
                 )
         self.class_weights = class_weights
+        self.last_data_loss = None
+        self.last_unweighted_data_loss = None
+        self.last_kl_loss = None
+        self.last_total_loss = None
+        self.last_annealing_coef = None
+        self.last_class_weights = None
+        self.last_weighted = class_weights is not None
         
         if loss_type == 'digamma':
             self.loss_fn = edl_digamma_loss
@@ -236,6 +243,7 @@ class EDLLoss(nn.Module):
             self.num_classes,
             reduction="none",
         )
+        unweighted_data_loss = per_sample_data_loss.mean()
 
         _, alpha = _compute_alpha(output)
         kl_alpha = target_onehot + (1 - target_onehot) * alpha
@@ -243,7 +251,7 @@ class EDLLoss(nn.Module):
         kl_loss = per_sample_kl.mean()
 
         if self.class_weights is None:
-            data_loss = per_sample_data_loss.mean()
+            data_loss = unweighted_data_loss
         else:
             if target.dim() == 1:
                 target_indices = target.long()
@@ -253,4 +261,16 @@ class EDLLoss(nn.Module):
             weighted_loss = per_sample_data_loss * sample_weights
             data_loss = weighted_loss.sum() / sample_weights.sum().clamp_min(1e-8)
 
-        return data_loss + self.kl_weight * annealing_coef * kl_loss
+        total_loss = data_loss + self.kl_weight * annealing_coef * kl_loss
+        self.last_data_loss = float(data_loss.detach().cpu())
+        self.last_unweighted_data_loss = float(unweighted_data_loss.detach().cpu())
+        self.last_kl_loss = float(kl_loss.detach().cpu())
+        self.last_total_loss = float(total_loss.detach().cpu())
+        self.last_annealing_coef = float(annealing_coef)
+        if self.class_weights is None:
+            self.last_class_weights = None
+            self.last_weighted = False
+        else:
+            self.last_class_weights = self.class_weights.detach().cpu().tolist()
+            self.last_weighted = True
+        return total_loss
