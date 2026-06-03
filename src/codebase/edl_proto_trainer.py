@@ -30,16 +30,24 @@ from edl_loss import EDLLoss
 from edl_proto_model import BreastClipPrototypeEDLClassifier
 from edl_trainer import (
     _amp_enabled,
+    _append_epoch_history,
     _append_skip_log,
     _assert_finite_tensor,
+    _class_weight_mode,
     _cuda_postfix,
     _edl_annealing_gate_visible_epoch,
+    _evidence_store,
+    _evidence_summary,
     _is_edl_annealing_complete,
     _compute_fold_class_weights,
     _empty_cuda_cache,
     _filter_valid_subbatch,
     _is_recoverable_batch_error,
+    _loss_component_meters,
+    _loss_component_summary,
     _placeholder_prediction_batch,
+    _record_evidence_batch,
+    _update_loss_component_meters,
     _valid_indices_from_fallback_flags,
     edl_get_dataloader,
     edl_valid_fn,
@@ -189,7 +197,10 @@ def _save_fold_metrics_csv(args, history, eval_split):
         "eval_split": [eval_split] * len(history["epochs"]),
         "edl_proto_loss_weight": [getattr(args, "edl_proto_loss_weight", 1.0)] * len(history["epochs"]),
     }
-    for key in PROTO_HISTORY_KEYS:
+    reserved = {"epochs", "train_loss", "valid_loss", "valid_aucroc"}
+    for key in sorted(history):
+        if key in reserved or not isinstance(history[key], list):
+            continue
         values = history.get(key, [])
         if len(values) == len(history["epochs"]):
             metric_data[key] = values
@@ -338,6 +349,8 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
     attract_losses = AverageMeter()
     separation_losses = AverageMeter()
     diversity_losses = AverageMeter()
+    component_meters = _loss_component_meters()
+    evidence_store = _evidence_store()
     start = time.time()
     skipped_batches = 0
 
@@ -400,6 +413,8 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
         attract_losses.update(float(proto_stats["attract_loss"].item()), batch_size)
         separation_losses.update(float(proto_stats["separation_loss"].item()), batch_size)
         diversity_losses.update(float(proto_stats["diversity_loss"].item()), batch_size)
+        _update_loss_component_meters(component_meters, criterion, batch_size)
+        _record_evidence_batch(evidence_store, labels, evidence)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -461,6 +476,10 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
         "separation_loss": separation_losses.avg,
         "diversity_loss": diversity_losses.avg,
     }
+    component_stats = _loss_component_summary(edl_losses, component_meters, skipped_batches)
+    for key, value in component_stats.items():
+        stats[f"edl_{key}"] = value
+    stats.update(_evidence_summary(evidence_store, "train", args.num_classes))
     return losses.avg, stats
 
 
@@ -711,6 +730,12 @@ def prototype_edl_train_loop(args, device):
 
     logger = SummaryWriter(args.tb_logs_path / f"prototype_edl_fold{args.cur_fold}")
     class_weights = _compute_fold_class_weights(args)
+    class_weight_mode = _class_weight_mode(args)
+    if class_weight_mode != "none" and class_weights is None:
+        raise ValueError(
+            f"class_weight_mode={class_weight_mode} but class_weights could not be computed for fold {args.cur_fold}. "
+            "Check train_folds labels before training."
+        )
     criterion = EDLLoss(
         num_classes=args.num_classes,
         loss_type=args.edl_loss_type,
@@ -718,6 +743,7 @@ def prototype_edl_train_loop(args, device):
         annealing_start=args.edl_annealing_start,
         annealing_epochs=args.edl_annealing_epochs,
         class_weights=class_weights,
+        focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
     )
 
     start_epoch, best_aucroc, epochs_no_improve, history = _load_last_checkpoint_if_available(
@@ -738,9 +764,10 @@ def prototype_edl_train_loop(args, device):
         avg_loss, train_loss_stats = prototype_edl_train_fn(
             train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, logger, device
         )
-        avg_val_loss, predictions = edl_valid_fn(
+        valid_stats, predictions = edl_valid_fn(
             valid_loader, model, criterion, args, device, epoch, logger=logger
         )
+        avg_val_loss = valid_stats["loss"]
         args.valid_folds = attach_patient_mean_predictions(
             args.valid_folds,
             predictions,
@@ -767,16 +794,34 @@ def prototype_edl_train_loop(args, device):
         logger.add_scalar("train/epoch_proto_diversity_loss", train_loss_stats["diversity_loss"], epoch + 1)
         logger.add_scalar("valid/epoch_loss", avg_val_loss, epoch + 1)
 
-        history["epochs"].append(epoch + 1)
-        history["train_loss"].append(avg_loss)
-        history["train_edl_loss"].append(train_loss_stats["edl_loss"])
-        history["train_proto_loss"].append(train_loss_stats["prototype_loss"])
-        history["train_proto_loss_raw"].append(train_loss_stats["prototype_loss_raw"])
-        history["train_proto_attract_loss"].append(train_loss_stats["attract_loss"])
-        history["train_proto_separation_loss"].append(train_loss_stats["separation_loss"])
-        history["train_proto_diversity_loss"].append(train_loss_stats["diversity_loss"])
-        history["valid_loss"].append(avg_val_loss)
-        history["valid_aucroc"].append(aucroc_val)
+        history_values = {
+            "train_loss": avg_loss,
+            "train_edl_loss": train_loss_stats["edl_loss"],
+            "train_proto_loss": train_loss_stats["prototype_loss"],
+            "train_proto_loss_raw": train_loss_stats["prototype_loss_raw"],
+            "train_proto_attract_loss": train_loss_stats["attract_loss"],
+            "train_proto_separation_loss": train_loss_stats["separation_loss"],
+            "train_proto_diversity_loss": train_loss_stats["diversity_loss"],
+            "valid_loss": avg_val_loss,
+            "valid_aucroc": aucroc_val,
+            "eval_data_loss": valid_stats["data_loss"],
+            "eval_unweighted_data_loss": valid_stats["unweighted_data_loss"],
+            "eval_class_weighted_data_loss": valid_stats["class_weighted_data_loss"],
+            "eval_focal_data_loss": valid_stats["focal_data_loss"],
+            "eval_kl_loss": valid_stats["kl_loss"],
+            "eval_total_loss": valid_stats["total_loss"],
+            "eval_annealing_coef": valid_stats["annealing_coef"],
+            "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
+            "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
+            "eval_skipped_batches": valid_stats["skipped_batches"],
+        }
+        for key, value in train_loss_stats.items():
+            if key.startswith("edl_"):
+                history_values[f"train_{key}"] = value
+            elif key.startswith("train_"):
+                history_values[key] = value
+        history_values.update({key: value for key, value in valid_stats.items() if key.startswith("eval_")})
+        _append_epoch_history(history, epoch + 1, history_values)
 
         if epoch == 0 or best_aucroc < aucroc_val:
             best_aucroc = aucroc_val

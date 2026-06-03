@@ -22,7 +22,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
@@ -163,6 +163,28 @@ def _weighted_bce_enabled(args):
     return str(getattr(args, "weighted_BCE", "n")).strip().lower() == "y"
 
 
+def _class_weight_mode(args):
+    mode = getattr(args, "class_weight_mode", None)
+    if mode is None or str(mode).strip() == "":
+        return "inverse" if _weighted_bce_enabled(args) else "none"
+    mode = str(mode).strip().lower()
+    if mode not in {"none", "inverse", "effective"}:
+        raise ValueError(f"Unsupported class_weight_mode: {mode}")
+    return mode
+
+
+def _balanced_sampler_mode(args):
+    mode = getattr(args, "balanced_sampler", None)
+    if mode is None:
+        mode = getattr(args, "balanced_dataloader", "none")
+    mode = str(mode).strip().lower()
+    if mode in {"n", "no", "false", "0", "none", ""}:
+        return "none"
+    if mode in {"y", "yes", "true", "1", "image"}:
+        return "image"
+    raise ValueError(f"Unsupported balanced_sampler: {mode}")
+
+
 def _json_safe(value):
     if isinstance(value, Path):
         return str(value)
@@ -224,6 +246,11 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
         "lr",
         "weight_decay",
         "weighted_BCE",
+        "balanced_sampler",
+        "balanced_dataloader",
+        "class_weight_mode",
+        "effective_beta",
+        "edl_focal_gamma",
         "train_mode",
         "freeze_backbone",
         "edl_loss_type",
@@ -241,6 +268,10 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
         {
             "module": "EDL",
             "weighted_BCE_enabled": _weighted_bce_enabled(args),
+            "class_weight_mode_resolved": _class_weight_mode(args),
+            "class_weight_info": getattr(args, "_edl_class_weight_info", None),
+            "balanced_sampler_resolved": _balanced_sampler_mode(args),
+            "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
             "csv_file": str(getattr(args, "_resolved_csv_path", getattr(args, "csv_file", ""))),
             "data_dir": str(getattr(args, "data_dir", "")),
             "img_dir": str(getattr(args, "img_dir", "")),
@@ -273,9 +304,13 @@ def _loss_component_meters():
     return {
         "data_loss": AverageMeter(),
         "unweighted_data_loss": AverageMeter(),
+        "class_weighted_data_loss": AverageMeter(),
+        "focal_data_loss": AverageMeter(),
         "kl_loss": AverageMeter(),
         "total_loss": AverageMeter(),
         "annealing_coef": AverageMeter(),
+        "focal_factor_mean": AverageMeter(),
+        "sample_weight_mean": AverageMeter(),
     }
 
 
@@ -283,9 +318,13 @@ def _update_loss_component_meters(meters, criterion, batch_size):
     attr_map = {
         "data_loss": "last_data_loss",
         "unweighted_data_loss": "last_unweighted_data_loss",
+        "class_weighted_data_loss": "last_class_weighted_data_loss",
+        "focal_data_loss": "last_focal_data_loss",
         "kl_loss": "last_kl_loss",
         "total_loss": "last_total_loss",
         "annealing_coef": "last_annealing_coef",
+        "focal_factor_mean": "last_focal_factor_mean",
+        "sample_weight_mean": "last_sample_weight_mean",
     }
     for key, attr in attr_map.items():
         value = getattr(criterion, attr, None)
@@ -341,6 +380,62 @@ def _score_quantiles(values):
         "score_max": float(values.max()),
         "score_mean": float(values.mean()),
     }
+
+
+def _evidence_store():
+    return {"labels": [], "evidence": [], "probability": [], "uncertainty": []}
+
+
+def _record_evidence_batch(store, labels, evidence):
+    with torch.no_grad():
+        evidence = evidence.detach().float()
+        probs = BreastClipEDLClassifier.compute_probabilities(evidence)
+        uncertainty = BreastClipEDLClassifier.compute_uncertainty(evidence)
+        store["labels"].append(labels.detach().long().cpu().numpy())
+        store["evidence"].append(evidence.cpu().numpy())
+        store["probability"].append(probs.cpu().numpy())
+        store["uncertainty"].append(uncertainty.cpu().numpy().reshape(-1))
+
+
+def _summary_stats(prefix, values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return {
+            f"{prefix}_mean": float("nan"),
+            f"{prefix}_q10": float("nan"),
+            f"{prefix}_q50": float("nan"),
+            f"{prefix}_q90": float("nan"),
+        }
+    return {
+        f"{prefix}_mean": float(np.mean(values)),
+        f"{prefix}_q10": float(np.quantile(values, 0.10)),
+        f"{prefix}_q50": float(np.quantile(values, 0.50)),
+        f"{prefix}_q90": float(np.quantile(values, 0.90)),
+    }
+
+
+def _evidence_summary(store, prefix, num_classes):
+    if not store["labels"]:
+        return {}
+
+    labels = np.concatenate(store["labels"]).astype(int)
+    evidence = np.concatenate(store["evidence"], axis=0).astype(float)
+    probs = np.concatenate(store["probability"], axis=0).astype(float)
+    uncertainty = np.concatenate(store["uncertainty"]).astype(float)
+    alpha_sum = evidence.sum(axis=1) + float(num_classes)
+
+    out = {}
+    for label_value in range(int(num_classes)):
+        mask = labels == label_value
+        label_prefix = f"{prefix}_label{label_value}"
+        out[f"{label_prefix}_n"] = int(mask.sum())
+        for class_idx in range(int(num_classes)):
+            out.update(_summary_stats(f"{label_prefix}_evidence_{class_idx}", evidence[mask, class_idx]))
+        out.update(_summary_stats(f"{label_prefix}_alpha_sum", alpha_sum[mask]))
+        out.update(_summary_stats(f"{label_prefix}_total_uncertainty", uncertainty[mask]))
+        out.update(_summary_stats(f"{label_prefix}_probability_1", probs[mask, -1]))
+    return out
 
 
 def _threshold_diagnostics(df, label_col, score_col, prefix, threshold=0.5):
@@ -471,23 +566,57 @@ def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best
 
 
 def _compute_fold_class_weights(args):
-    if str(getattr(args, "weighted_BCE", "n")).lower() != "y":
-        return None
-
+    mode = _class_weight_mode(args)
     fold_train = args.train_folds
     n_neg = int((fold_train[args.label] == 0).sum())
     n_pos = int((fold_train[args.label] == 1).sum())
-    if n_pos <= 0:
-        print(f"Fold {args.cur_fold} has no positive samples; using unweighted EDL CE.")
+    info = {
+        "fold": int(getattr(args, "cur_fold", -1)),
+        "mode": mode,
+        "n_neg": n_neg,
+        "n_pos": n_pos,
+        "effective_beta": getattr(args, "effective_beta", None),
+        "class_weights": None,
+    }
+
+    if mode == "none":
+        args._edl_class_weight_info = info
         return None
 
-    w_neg = 1.0
-    w_pos = float(n_neg / n_pos)
+    if n_pos <= 0:
+        print(f"Fold {args.cur_fold} has no positive samples; using unweighted EDL CE.")
+        args._edl_class_weight_info = info
+        return None
+    if n_neg <= 0:
+        print(f"Fold {args.cur_fold} has no negative samples; using unweighted EDL CE.")
+        args._edl_class_weight_info = info
+        return None
+
+    if mode == "inverse":
+        w_neg = 1.0
+        w_pos = float(n_neg / n_pos)
+    else:
+        beta = float(getattr(args, "effective_beta", 0.9999))
+        if beta < 0.0 or beta >= 1.0:
+            raise ValueError("--effective-beta must be in [0, 1).")
+        if beta == 0.0:
+            weights = np.array([1.0, 1.0], dtype=np.float64)
+        else:
+            effective_neg = (1.0 - np.power(beta, n_neg)) / (1.0 - beta)
+            effective_pos = (1.0 - np.power(beta, n_pos)) / (1.0 - beta)
+            weights = np.array([1.0 / effective_neg, 1.0 / effective_pos], dtype=np.float64)
+        weights = weights / np.mean(weights)
+        w_neg = float(weights[0])
+        w_pos = float(weights[1])
+
+    class_weights = [w_neg, w_pos]
+    info["class_weights"] = class_weights
+    args._edl_class_weight_info = info
     print(
-        f"Fold {args.cur_fold} class weights -> n_neg={n_neg}, n_pos={n_pos}, "
+        f"Fold {args.cur_fold} class weights ({mode}) -> n_neg={n_neg}, n_pos={n_pos}, "
         f"w_neg={w_neg:.6f}, w_pos={w_pos:.6f}"
     )
-    return [w_neg, w_pos]
+    return class_weights
 
 
 def _save_fold_loss_curve(args, history):
@@ -766,9 +895,10 @@ def edl_train_loop(args, device):
 
     logger = SummaryWriter(args.tb_logs_path / f'edl_fold{args.cur_fold}')
     class_weights = _compute_fold_class_weights(args)
-    if _weighted_bce_enabled(args) and class_weights is None:
+    class_weight_mode = _class_weight_mode(args)
+    if class_weight_mode != "none" and class_weights is None:
         raise ValueError(
-            f"weighted_BCE=y but class_weights could not be computed for fold {args.cur_fold}. "
+            f"class_weight_mode={class_weight_mode} but class_weights could not be computed for fold {args.cur_fold}. "
             "Check train_folds labels before training."
         )
     _write_edl_run_config(
@@ -780,9 +910,14 @@ def edl_train_loop(args, device):
             "train_counts": _class_count_summary(args.train_folds, args.label),
             "eval_counts": _class_count_summary(args.valid_folds, args.label),
             "weighted_BCE_enabled": _weighted_bce_enabled(args),
+            "class_weight_mode": class_weight_mode,
+            "class_weight_info": getattr(args, "_edl_class_weight_info", None),
             "class_weights": class_weights,
             "class_weight_negative": class_weights[0] if class_weights is not None else None,
             "class_weight_positive": class_weights[1] if class_weights is not None and len(class_weights) > 1 else None,
+            "balanced_sampler": _balanced_sampler_mode(args),
+            "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
+            "edl_focal_gamma": getattr(args, "edl_focal_gamma", 0.0),
             "best_checkpoint_path": str(_fold_best_model_path(args)),
             "last_checkpoint_path": str(_fold_last_checkpoint_path(args)),
             "metrics_csv": str(_metrics_csv_path(args)),
@@ -795,6 +930,7 @@ def edl_train_loop(args, device):
         annealing_start=args.edl_annealing_start,
         annealing_epochs=args.edl_annealing_epochs,
         class_weights=class_weights,
+        focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
     )
 
     start_epoch, best_aucroc, epochs_no_improve, history = _load_last_checkpoint_if_available(
@@ -851,6 +987,16 @@ def edl_train_loop(args, device):
         logger.add_scalar('valid/data_loss', valid_stats["data_loss"], epoch + 1)
         logger.add_scalar('valid/unweighted_data_loss', valid_stats["unweighted_data_loss"], epoch + 1)
         logger.add_scalar('valid/kl_loss', valid_stats["kl_loss"], epoch + 1)
+        for loss_key in (
+            "class_weighted_data_loss",
+            "focal_data_loss",
+            "focal_factor_mean",
+            "sample_weight_mean",
+        ):
+            if loss_key in train_stats and np.isfinite(float(train_stats[loss_key])):
+                logger.add_scalar(f"train/{loss_key}", train_stats[loss_key], epoch + 1)
+            if loss_key in valid_stats and np.isfinite(float(valid_stats[loss_key])):
+                logger.add_scalar(f"valid/{loss_key}", valid_stats[loss_key], epoch + 1)
 
         history_values = {
             "train_loss": avg_loss,
@@ -858,19 +1004,29 @@ def edl_train_loop(args, device):
             "valid_aucroc": aucroc_val,
             "train_data_loss": train_stats["data_loss"],
             "train_unweighted_data_loss": train_stats["unweighted_data_loss"],
+            "train_class_weighted_data_loss": train_stats["class_weighted_data_loss"],
+            "train_focal_data_loss": train_stats["focal_data_loss"],
             "train_kl_loss": train_stats["kl_loss"],
             "train_total_loss": train_stats["total_loss"],
             "train_annealing_coef": train_stats["annealing_coef"],
+            "train_focal_factor_mean": train_stats["focal_factor_mean"],
+            "train_sample_weight_mean": train_stats["sample_weight_mean"],
             "train_skipped_batches": train_stats["skipped_batches"],
             "eval_data_loss": valid_stats["data_loss"],
             "eval_unweighted_data_loss": valid_stats["unweighted_data_loss"],
+            "eval_class_weighted_data_loss": valid_stats["class_weighted_data_loss"],
+            "eval_focal_data_loss": valid_stats["focal_data_loss"],
             "eval_kl_loss": valid_stats["kl_loss"],
             "eval_total_loss": valid_stats["total_loss"],
             "eval_annealing_coef": valid_stats["annealing_coef"],
+            "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
+            "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
             "eval_skipped_batches": valid_stats["skipped_batches"],
         }
         history_values.update(patient_diag)
         history_values.update(image_diag)
+        history_values.update({key: value for key, value in train_stats.items() if key.startswith("train_")})
+        history_values.update({key: value for key, value in valid_stats.items() if key.startswith("eval_")})
         _append_epoch_history(history, epoch + 1, history_values)
 
         if epoch == 0 or best_aucroc < aucroc_val:
@@ -1064,8 +1220,51 @@ def edl_get_dataloader(args):
     train_dataset = MammoDataset(args=args, df=args.train_folds, transform=train_tfm)
     valid_dataset = MammoDataset(args=args, df=args.valid_folds, transform=val_tfm)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=True,
+    sampler = None
+    shuffle_train = True
+    sampler_mode = _balanced_sampler_mode(args)
+    args._balanced_sampler_stats = {
+        "mode": sampler_mode,
+        "enabled": False,
+        "num_samples": int(len(args.train_folds)),
+    }
+    if sampler_mode == "image":
+        labels = pd.to_numeric(args.train_folds[args.label], errors="coerce")
+        pos_mask = (labels == 1).to_numpy()
+        neg_mask = (labels == 0).to_numpy()
+        n_pos = int(pos_mask.sum())
+        n_neg = int(neg_mask.sum())
+        weights = np.zeros(len(labels), dtype=np.float64)
+        if n_pos <= 0 or n_neg <= 0:
+            print(
+                f"[WARN] balanced-sampler=image disabled for fold {args.cur_fold}: "
+                f"n_pos={n_pos}, n_neg={n_neg}."
+            )
+        else:
+            weights[pos_mask] = 0.5 / float(n_pos)
+            weights[neg_mask] = 0.5 / float(n_neg)
+            sampler = WeightedRandomSampler(
+                weights=torch.as_tensor(weights, dtype=torch.double),
+                num_samples=len(weights),
+                replacement=True,
+            )
+            shuffle_train = False
+            args._balanced_sampler_stats.update(
+                {
+                    "enabled": True,
+                    "n_pos": n_pos,
+                    "n_neg": n_neg,
+                    "expected_positive_fraction": 0.5,
+                    "replacement": True,
+                }
+            )
+            print(
+                f"Fold {args.cur_fold} balanced image sampler -> "
+                f"n_pos={n_pos}, n_neg={n_neg}, num_samples={len(weights)}, replacement=True"
+            )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=args.batch_size, shuffle=shuffle_train, sampler=sampler,
         num_workers=args.num_workers, pin_memory=True, drop_last=True,
         collate_fn=collator_mammo_dataset_w_concepts
     )
@@ -1084,6 +1283,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     amp_enabled = scaler.is_enabled()
     losses = AverageMeter()
     component_meters = _loss_component_meters()
+    evidence_store = _evidence_store()
     start = end = time.time()
     skipped_batches = 0
 
@@ -1136,6 +1336,7 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
 
         losses.update(float(loss.item()), batch_size)
         _update_loss_component_meters(component_meters, criterion, batch_size)
+        _record_evidence_batch(evidence_store, labels, evidence)
 
         scaler.scale(loss).backward()
         scaler.step(optimizer)
@@ -1172,14 +1373,17 @@ def edl_train_fn(train_loader, model, criterion, optimizer, epoch, args, schedul
     if skipped_batches > 0:
         print(f"Epoch {epoch + 1}: skipped {skipped_batches} train batch(es).")
 
-    return _loss_component_summary(losses, component_meters, skipped_batches)
+    stats = _loss_component_summary(losses, component_meters, skipped_batches)
+    stats.update(_evidence_summary(evidence_store, "train", args.num_classes))
+    return stats
 
 
 def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=None):
     """EDL验证一个epoch"""
     losses = AverageMeter()
     component_meters = _loss_component_meters()
-    model.eval()
+    evidence_store = _evidence_store()
+    model.eval()
     preds = []
     skipped_batches = 0
     start = time.time()
@@ -1257,6 +1461,7 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
 
         losses.update(loss.item(), batch_size)
         _update_loss_component_meters(component_meters, criterion, batch_size)
+        _record_evidence_batch(evidence_store, labels, evidence)
         batch_pos_probs[valid_indices] = pos_probs
         preds.append(batch_pos_probs)
 
@@ -1282,7 +1487,9 @@ def edl_valid_fn(valid_loader, model, criterion, args, device, epoch=1, logger=N
     if skipped_batches > 0:
         print(f"Epoch {epoch + 1}: recovered {skipped_batches} valid batch(es).")
 
-    return _loss_component_summary(losses, component_meters, skipped_batches), predictions
+    stats = _loss_component_summary(losses, component_meters, skipped_batches)
+    stats.update(_evidence_summary(evidence_store, "eval", args.num_classes))
+    return stats, predictions
 
 
 

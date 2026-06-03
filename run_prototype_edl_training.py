@@ -41,6 +41,10 @@ WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 1
 SEED = 42
 WEIGHTED_BCE = "y"
+BALANCED_SAMPLER = "none"
+CLASS_WEIGHT_MODE = None
+EFFECTIVE_BETA = 0.9999
+EDL_FOCAL_GAMMA = 0.0
 
 IMG_SIZE = [912, 1520]
 
@@ -122,6 +126,30 @@ def build_parser():
     parser.add_argument("--warmup-epochs", type=float, default=WARMUP_EPOCHS, help="Warmup epochs.")
     parser.add_argument("--seed", type=int, default=SEED, help="Random seed.")
     parser.add_argument("--weighted-bce", default=WEIGHTED_BCE, help="Whether to use class weights: y/n.")
+    parser.add_argument(
+        "--balanced-sampler",
+        choices=["none", "image"],
+        default=BALANCED_SAMPLER,
+        help="Use image-level balanced sampling. none keeps the original shuffled dataloader.",
+    )
+    parser.add_argument(
+        "--class-weight-mode",
+        choices=["none", "inverse", "effective"],
+        default=CLASS_WEIGHT_MODE,
+        help="Class weighting mode. Default keeps old weighted-bce compatibility: y->inverse, n->none.",
+    )
+    parser.add_argument(
+        "--effective-beta",
+        type=float,
+        default=EFFECTIVE_BETA,
+        help="Beta for effective-number class weights; used only with --class-weight-mode effective.",
+    )
+    parser.add_argument(
+        "--edl-focal-gamma",
+        type=float,
+        default=EDL_FOCAL_GAMMA,
+        help="Focal gamma applied to EDL data loss. 0.0 disables focal loss.",
+    )
     parser.add_argument("--img-size", nargs=2, type=int, default=IMG_SIZE, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--device", default=DEVICE, help="Training device, e.g. cuda or cpu.")
     parser.add_argument("--num-workers", type=int, default=NUM_WORKERS, help="Dataloader worker count.")
@@ -266,6 +294,10 @@ def build_parser():
 
 def main():
     cli_args = build_parser().parse_args()
+    if cli_args.edl_focal_gamma < 0:
+        raise ValueError("--edl-focal-gamma must be non-negative.")
+    if cli_args.effective_beta < 0 or cli_args.effective_beta >= 1:
+        raise ValueError("--effective-beta must be in [0, 1).")
     if cli_args.edl_proto_k <= 0:
         raise ValueError("--edl-proto-k must be positive.")
     if cli_args.edl_proto_topk <= 0:
@@ -397,7 +429,11 @@ def main():
     args.data_frac = 1.0
     args.weighted_BCE = cli_args.weighted_bce
     args.patience = cli_args.patience
-    args.balanced_dataloader = "n"
+    args.balanced_sampler = cli_args.balanced_sampler
+    args.balanced_dataloader = "y" if args.balanced_sampler != "none" else "n"
+    args.class_weight_mode = cli_args.class_weight_mode
+    args.effective_beta = cli_args.effective_beta
+    args.edl_focal_gamma = cli_args.edl_focal_gamma
     args.train_mode = cli_args.train_mode
     args.freeze_backbone = "y" if args.train_mode == "head_only" else "n"
     args.resume = cli_args.resume
@@ -425,12 +461,23 @@ def main():
     proto_loss_weight_suffix = ""
     if abs(args.edl_proto_loss_weight - EDL_PROTO_LOSS_WEIGHT) > 1e-12:
         proto_loss_weight_suffix = f"_proto_w{args.edl_proto_loss_weight}"
+    balance_suffix_parts = []
+    if args.balanced_sampler != "none":
+        balance_suffix_parts.append(f"sampler_{args.balanced_sampler}")
+    if args.class_weight_mode is not None:
+        balance_suffix_parts.append(f"cw_{args.class_weight_mode}")
+    if args.class_weight_mode == "effective":
+        balance_suffix_parts.append(f"beta_{args.effective_beta:g}")
+    if args.edl_focal_gamma > 0:
+        balance_suffix_parts.append(f"focal_g{args.edl_focal_gamma:g}")
+    balance_suffix = f"_{'_'.join(balance_suffix_parts)}" if balance_suffix_parts else ""
 
     base_root = (
         f"lr_{args.lr}_epochs_{args.epochs}_prototype_edl_{args.edl_loss_type}_{args.label}_"
         f"k_{args.edl_proto_k}_proto_a{args.edl_proto_attract_weight}_"
         f"s{args.edl_proto_separation_weight}_d{args.edl_proto_diversity_weight}{proto_loss_weight_suffix}_"
         f"m{args.edl_proto_margin}_bal_{'y' if args.edl_proto_balance_classes else 'n'}_mode_{args.train_mode}"
+        f"{balance_suffix}"
     )
     args.root, args.run_id = append_run_id(base_root, cli_args.run_id)
     chk_pt_path = Path(args.checkpoints) / args.dataset / "prototype_edl_classifier" / args.arch / args.root
@@ -470,6 +517,10 @@ def main():
     print(f"edl_proto_loss_weight: {args.edl_proto_loss_weight}")
     print(f"edl_proto_margin: {args.edl_proto_margin}")
     print(f"edl_proto_balance_classes: {args.edl_proto_balance_classes}")
+    print(f"balanced_sampler: {args.balanced_sampler}")
+    print(f"class_weight_mode: {args.class_weight_mode or 'auto'}")
+    print(f"effective_beta: {args.effective_beta}")
+    print(f"edl_focal_gamma: {args.edl_focal_gamma}")
     print(f"train_mode: {args.train_mode}")
     print(f"freeze_backbone: {args.freeze_backbone}")
     print(f"resume: {args.resume}")

@@ -171,6 +171,7 @@ class EDLLoss(nn.Module):
         annealing_epochs=10,
         annealing_step=None,
         class_weights=None,
+        focal_gamma=0.0,
     ):
         """
         Args:
@@ -195,12 +196,19 @@ class EDLLoss(nn.Module):
                     f"class_weights length {class_weights.numel()} does not match num_classes={num_classes}"
                 )
         self.class_weights = class_weights
+        self.focal_gamma = float(focal_gamma or 0.0)
+        if self.focal_gamma < 0:
+            raise ValueError("focal_gamma must be non-negative.")
         self.last_data_loss = None
         self.last_unweighted_data_loss = None
+        self.last_class_weighted_data_loss = None
+        self.last_focal_data_loss = None
         self.last_kl_loss = None
         self.last_total_loss = None
         self.last_annealing_coef = None
         self.last_class_weights = None
+        self.last_focal_factor_mean = None
+        self.last_sample_weight_mean = None
         self.last_weighted = class_weights is not None
         
         if loss_type == 'digamma':
@@ -226,9 +234,12 @@ class EDLLoss(nn.Module):
 
         if target.dim() == 1:
             target_onehot = F.one_hot(target.long(), num_classes=self.num_classes).float()
+            target_indices = target.long().to(output.device)
         else:
             target_onehot = target.float()
         target_onehot = target_onehot.to(device=output.device, dtype=output.dtype)
+        if target.dim() != 1:
+            target_indices = torch.argmax(target_onehot, dim=1).long().to(output.device)
         
         epoch_num = getattr(self, 'current_epoch', 0)
         annealing_coef = get_annealing_coef(
@@ -246,27 +257,41 @@ class EDLLoss(nn.Module):
         unweighted_data_loss = per_sample_data_loss.mean()
 
         _, alpha = _compute_alpha(output)
+        probs = alpha / torch.sum(alpha, dim=1, keepdim=True)
+        p_true = probs.gather(1, target_indices.view(-1, 1)).squeeze(1).clamp(1e-8, 1.0)
+        if self.focal_gamma > 0:
+            focal_factor = (1.0 - p_true).pow(self.focal_gamma)
+        else:
+            focal_factor = torch.ones_like(per_sample_data_loss)
+
         kl_alpha = target_onehot + (1 - target_onehot) * alpha
         per_sample_kl = kl_divergence(kl_alpha, self.num_classes)
         kl_loss = per_sample_kl.mean()
 
         if self.class_weights is None:
-            data_loss = unweighted_data_loss
+            sample_weights = torch.ones_like(per_sample_data_loss)
         else:
-            if target.dim() == 1:
-                target_indices = target.long()
-            else:
-                target_indices = torch.argmax(target_onehot, dim=1)
             sample_weights = self.class_weights.to(output.device)[target_indices]
-            weighted_loss = per_sample_data_loss * sample_weights
-            data_loss = weighted_loss.sum() / sample_weights.sum().clamp_min(1e-8)
+
+        weighted_loss = per_sample_data_loss * sample_weights
+        class_weighted_data_loss = weighted_loss.sum() / sample_weights.sum().clamp_min(1e-8)
+        focal_data_loss = (per_sample_data_loss * focal_factor).mean()
+        focal_weighted_loss = weighted_loss * focal_factor
+        if self.class_weights is None:
+            data_loss = focal_weighted_loss.mean()
+        else:
+            data_loss = focal_weighted_loss.sum() / sample_weights.sum().clamp_min(1e-8)
 
         total_loss = data_loss + self.kl_weight * annealing_coef * kl_loss
         self.last_data_loss = float(data_loss.detach().cpu())
         self.last_unweighted_data_loss = float(unweighted_data_loss.detach().cpu())
+        self.last_class_weighted_data_loss = float(class_weighted_data_loss.detach().cpu())
+        self.last_focal_data_loss = float(focal_data_loss.detach().cpu())
         self.last_kl_loss = float(kl_loss.detach().cpu())
         self.last_total_loss = float(total_loss.detach().cpu())
         self.last_annealing_coef = float(annealing_coef)
+        self.last_focal_factor_mean = float(focal_factor.detach().mean().cpu())
+        self.last_sample_weight_mean = float(sample_weights.detach().mean().cpu())
         if self.class_weights is None:
             self.last_class_weights = None
             self.last_weighted = False
