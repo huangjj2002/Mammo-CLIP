@@ -209,6 +209,12 @@ class EDLLoss(nn.Module):
         self.last_class_weights = None
         self.last_focal_factor_mean = None
         self.last_sample_weight_mean = None
+        self.last_focal_weighted_denominator = None
+        self.last_class_counts = None
+        self.last_class_data_loss_means = None
+        self.last_class_weighted_loss_means = None
+        self.last_class_focal_weighted_loss_means = None
+        self.last_class_focal_factor_means = None
         self.last_weighted = class_weights is not None
         
         if loss_type == 'digamma':
@@ -279,10 +285,35 @@ class EDLLoss(nn.Module):
         focal_weighted_loss = weighted_loss * focal_factor
         if self.class_weights is None:
             data_loss = focal_weighted_loss.mean()
+            focal_weighted_denominator = torch.as_tensor(
+                per_sample_data_loss.numel(),
+                dtype=output.dtype,
+                device=output.device,
+            )
         else:
-            data_loss = focal_weighted_loss.sum() / sample_weights.sum().clamp_min(1e-8)
+            focal_weighted_denominator = (sample_weights * focal_factor).sum().clamp_min(1e-8)
+            data_loss = focal_weighted_loss.sum() / focal_weighted_denominator
 
         total_loss = data_loss + self.kl_weight * annealing_coef * kl_loss
+        class_counts = []
+        class_data_loss_means = []
+        class_weighted_loss_means = []
+        class_focal_weighted_loss_means = []
+        class_focal_factor_means = []
+        for class_idx in range(self.num_classes):
+            class_mask = target_indices == class_idx
+            class_counts.append(int(class_mask.detach().sum().cpu()))
+            if class_mask.any():
+                class_data_loss_means.append(float(per_sample_data_loss[class_mask].detach().mean().cpu()))
+                class_weighted_loss_means.append(float(weighted_loss[class_mask].detach().mean().cpu()))
+                class_focal_weighted_loss_means.append(float(focal_weighted_loss[class_mask].detach().mean().cpu()))
+                class_focal_factor_means.append(float(focal_factor[class_mask].detach().mean().cpu()))
+            else:
+                class_data_loss_means.append(float("nan"))
+                class_weighted_loss_means.append(float("nan"))
+                class_focal_weighted_loss_means.append(float("nan"))
+                class_focal_factor_means.append(float("nan"))
+
         self.last_data_loss = float(data_loss.detach().cpu())
         self.last_unweighted_data_loss = float(unweighted_data_loss.detach().cpu())
         self.last_class_weighted_data_loss = float(class_weighted_data_loss.detach().cpu())
@@ -292,6 +323,12 @@ class EDLLoss(nn.Module):
         self.last_annealing_coef = float(annealing_coef)
         self.last_focal_factor_mean = float(focal_factor.detach().mean().cpu())
         self.last_sample_weight_mean = float(sample_weights.detach().mean().cpu())
+        self.last_focal_weighted_denominator = float(focal_weighted_denominator.detach().cpu())
+        self.last_class_counts = class_counts
+        self.last_class_data_loss_means = class_data_loss_means
+        self.last_class_weighted_loss_means = class_weighted_loss_means
+        self.last_class_focal_weighted_loss_means = class_focal_weighted_loss_means
+        self.last_class_focal_factor_means = class_focal_factor_means
         if self.class_weights is None:
             self.last_class_weights = None
             self.last_weighted = False

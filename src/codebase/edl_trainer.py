@@ -185,6 +185,98 @@ def _balanced_sampler_mode(args):
     raise ValueError(f"Unsupported balanced_sampler: {mode}")
 
 
+def _prediction_group_cols(args):
+    group_cols = getattr(args, "prediction_group_cols", "patient_id")
+    if isinstance(group_cols, str):
+        group_cols = [col.strip() for col in group_cols.split(",") if col.strip()]
+    else:
+        group_cols = [str(col).strip() for col in group_cols if str(col).strip()]
+    return group_cols or ["patient_id"]
+
+
+def _prediction_score_agg(args):
+    score_agg = str(getattr(args, "prediction_score_agg", "mean") or "mean").strip().lower()
+    if score_agg not in {"mean", "max"}:
+        raise ValueError(f"Unsupported prediction_score_agg: {score_agg}. Use mean or max.")
+    return score_agg
+
+
+def _prediction_threshold(args):
+    return float(getattr(args, "prediction_threshold", 0.5))
+
+
+def _prediction_aggregation_config(args):
+    return {
+        "prediction_group_cols": _prediction_group_cols(args),
+        "prediction_score_agg": _prediction_score_agg(args),
+        "prediction_threshold": _prediction_threshold(args),
+    }
+
+
+def _attach_prediction_scores(args, df, image_scores, image_score_col="image_prediction_prob"):
+    return attach_patient_mean_predictions(
+        df,
+        image_scores,
+        image_score_col=image_score_col,
+        group_cols=_prediction_group_cols(args),
+        score_agg=_prediction_score_agg(args),
+        threshold=_prediction_threshold(args),
+    )
+
+
+def _aggregate_prediction_scores(args, df, label_col, score_col):
+    return patient_level_aggregate(
+        df,
+        label_col,
+        score_col,
+        group_cols=_prediction_group_cols(args),
+        score_agg=_prediction_score_agg(args),
+    )
+
+
+def _best_metric_name(args):
+    metric = str(getattr(args, "edl_best_metric", "eval_aucroc") or "eval_aucroc").strip()
+    aliases = {"aucroc": "eval_aucroc", "auroc": "eval_aucroc", "valid_aucroc": "eval_aucroc"}
+    return aliases.get(metric.lower(), metric)
+
+
+def _current_best_metric_value(args, history_values, aucroc_value):
+    metric_name = _best_metric_name(args)
+    if metric_name == "eval_aucroc":
+        return float(aucroc_value)
+    if metric_name not in history_values:
+        available = sorted(key for key, value in history_values.items() if np.isscalar(value))
+        raise KeyError(
+            f"Requested --edl-best-metric {metric_name!r} is not available. "
+            f"Available scalar metrics include: {available}"
+        )
+    return float(history_values[metric_name])
+
+
+def _load_best_metric_value_from_checkpoint(args, checkpoint, default=0.0):
+    metric_name = _best_metric_name(args)
+    checkpoint_metric = checkpoint.get("best_metric_name")
+    if checkpoint_metric == metric_name:
+        return float(checkpoint.get("best_metric_value", checkpoint.get("best_aucroc", default)))
+    if checkpoint_metric is None and metric_name == "eval_aucroc":
+        return float(checkpoint.get("best_aucroc", default))
+    if checkpoint_metric is not None:
+        print(
+            f"Checkpoint best metric {checkpoint_metric!r} differs from requested {metric_name!r}; "
+            "resetting best metric value for this resume."
+        )
+    return float(default)
+
+
+def _best_metric_column(args, metrics_df):
+    metric_name = _best_metric_name(args)
+    if metric_name == "eval_aucroc":
+        return "eval_aucroc"
+    if metric_name not in metrics_df.columns:
+        raise KeyError(f"Best metric {metric_name!r} is missing from metrics CSV columns.")
+    return metric_name
+
+
 def _json_safe(value):
     if isinstance(value, Path):
         return str(value)
@@ -259,6 +351,10 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
         "edl_annealing_epochs",
         "edl_dropout",
         "edl_hidden_dim",
+        "prediction_group_cols",
+        "prediction_score_agg",
+        "prediction_threshold",
+        "edl_best_metric",
         "num_classes",
         "label",
         "patience",
@@ -272,6 +368,8 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
             "class_weight_info": getattr(args, "_edl_class_weight_info", None),
             "balanced_sampler_resolved": _balanced_sampler_mode(args),
             "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
+            "prediction_aggregation": _prediction_aggregation_config(args),
+            "best_metric_name": _best_metric_name(args),
             "csv_file": str(getattr(args, "_resolved_csv_path", getattr(args, "csv_file", ""))),
             "data_dir": str(getattr(args, "data_dir", "")),
             "img_dir": str(getattr(args, "img_dir", "")),
@@ -311,6 +409,7 @@ def _loss_component_meters():
         "annealing_coef": AverageMeter(),
         "focal_factor_mean": AverageMeter(),
         "sample_weight_mean": AverageMeter(),
+        "focal_weighted_denominator": AverageMeter(),
     }
 
 
@@ -325,11 +424,34 @@ def _update_loss_component_meters(meters, criterion, batch_size):
         "annealing_coef": "last_annealing_coef",
         "focal_factor_mean": "last_focal_factor_mean",
         "sample_weight_mean": "last_sample_weight_mean",
+        "focal_weighted_denominator": "last_focal_weighted_denominator",
     }
     for key, attr in attr_map.items():
         value = getattr(criterion, attr, None)
         if value is not None and np.isfinite(float(value)):
             meters[key].update(float(value), batch_size)
+    class_counts = getattr(criterion, "last_class_counts", None)
+    class_attr_map = {
+        "data_loss_mean": "last_class_data_loss_means",
+        "weighted_loss_mean": "last_class_weighted_loss_means",
+        "focal_weighted_loss_mean": "last_class_focal_weighted_loss_means",
+        "focal_factor_mean": "last_class_focal_factor_means",
+    }
+    if class_counts is None:
+        return
+    for class_idx, class_count in enumerate(class_counts):
+        if int(class_count) <= 0:
+            continue
+        for suffix, attr in class_attr_map.items():
+            values = getattr(criterion, attr, None)
+            if values is None or class_idx >= len(values):
+                continue
+            value = values[class_idx]
+            if value is not None and np.isfinite(float(value)):
+                key = f"label{class_idx}_{suffix}"
+                if key not in meters:
+                    meters[key] = AverageMeter()
+                meters[key].update(float(value), int(class_count))
 
 
 def _loss_component_summary(losses, meters, skipped_batches=0):
@@ -446,6 +568,7 @@ def _threshold_diagnostics(df, label_col, score_col, prefix, threshold=0.5):
             f"{prefix}_negative_n": 0,
             f"{prefix}_aucroc": float("nan"),
             f"{prefix}_pred_pos_at_0_5": 0,
+            f"{prefix}_threshold": float(threshold),
         }
     labels = pd.to_numeric(df[label_col], errors="coerce")
     scores = pd.to_numeric(df[score_col], errors="coerce")
@@ -464,6 +587,7 @@ def _threshold_diagnostics(df, label_col, score_col, prefix, threshold=0.5):
         f"{prefix}_positive_n": int((labels == 1).sum()),
         f"{prefix}_negative_n": int((labels == 0).sum()),
         f"{prefix}_aucroc": _safe_auroc(labels, scores),
+        f"{prefix}_threshold": float(threshold),
         f"{prefix}_bacc_at_0_5": (sensitivity + specificity) / 2.0,
         f"{prefix}_sensitivity_at_0_5": sensitivity,
         f"{prefix}_specificity_at_0_5": specificity,
@@ -531,7 +655,7 @@ def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler
         scaler.load_state_dict(scaler_state)
 
     start_epoch = int(ckpt.get("epoch", -1)) + 1
-    best_aucroc = float(ckpt.get("best_aucroc", 0.0))
+    best_aucroc = _load_best_metric_value_from_checkpoint(args, ckpt, default=0.0)
     epochs_no_improve = int(ckpt.get("epochs_no_improve", 0))
     history = ckpt.get("history", history)
     if not _is_edl_annealing_complete(args, int(ckpt.get("epoch", -1))):
@@ -539,7 +663,7 @@ def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler
 
     print(
         f"Resumed fold {args.cur_fold} from {last_ckpt_path} "
-        f"(next_epoch={start_epoch + 1}, best_aucroc={best_aucroc:.4f})"
+        f"(next_epoch={start_epoch + 1}, best_{_best_metric_name(args)}={best_aucroc:.4f})"
     )
     if not _is_edl_annealing_complete(args, start_epoch - 1):
         print(
@@ -557,6 +681,8 @@ def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
         "epoch": epoch,
         "best_aucroc": best_aucroc,
+        "best_metric_name": _best_metric_name(args),
+        "best_metric_value": best_aucroc,
         "epochs_no_improve": epochs_no_improve,
         "history": history,
         "train_mode": getattr(args, "train_mode", "full"),
@@ -699,7 +825,8 @@ def _record_fold_summary(args, metrics_df, summaries):
     if metrics_df.empty:
         return
 
-    best_idx = metrics_df["eval_aucroc"].idxmax()
+    metric_col = _best_metric_column(args, metrics_df)
+    best_idx = metrics_df[metric_col].idxmax()
     best_row = metrics_df.loc[best_idx]
     summaries.append(
         {
@@ -707,6 +834,8 @@ def _record_fold_summary(args, metrics_df, summaries):
             "eval_split": best_row["eval_split"],
             "best_epoch": int(best_row["epoch"]),
             "best_aucroc": float(best_row["eval_aucroc"]),
+            "best_metric_name": metric_col,
+            "best_metric_value": float(best_row[metric_col]),
             "checkpoint_path": str(_fold_best_model_path(args)),
             "metrics_csv": str(_metrics_csv_path(args)),
         }
@@ -799,7 +928,7 @@ def do_edl_experiments(args, device):
     if args.n_folds > 0 and len(oof_df) > 0:
         oof_df = oof_df.reset_index(drop=True)
         print('\n================ CV (Out-of-Fold) ================')
-        oof_agg = patient_level_aggregate(oof_df, args.label, 'prediction_prob')
+        oof_agg = _aggregate_prediction_scores(args, oof_df, args.label, 'prediction_prob')
         aucroc_val = auroc(gt=oof_agg[args.label].values.astype(int), pred=oof_agg['prediction_prob'].values)
         print(f'OOF AUC-ROC: {aucroc_val:.4f}')
         oof_df.to_csv(args.output_path / f'edl_seed_{args.seed}_n_folds_{args.n_folds}_oof_outputs.csv', index=False)
@@ -818,12 +947,13 @@ def do_edl_experiments(args, device):
         for col in all_evidence_cols + all_alpha_cols + all_prob_cols + ['total_uncertainty', image_score_col]:
             ensemble_output[col] = np.mean([fd[col].values for fd in fold_prediction_arrays], axis=0)
 
-        ensemble_output = attach_patient_mean_predictions(
+        ensemble_output = _attach_prediction_scores(
+            args,
             ensemble_output,
             ensemble_output[image_score_col].values,
             image_score_col=image_score_col,
         )
-        ensemble_output['prediction_label'] = (ensemble_output['prediction_prob'] >= 0.5).astype(int)
+        ensemble_output['prediction_label'] = (ensemble_output['prediction_prob'] >= _prediction_threshold(args)).astype(int)
         ensemble_csv_path = args.output_path / 'edl_ensemble_all_predictions.csv'
         ensemble_output['model_fold'] = 'ensemble'
         ensemble_output.to_csv(ensemble_csv_path, index=False)
@@ -918,6 +1048,8 @@ def edl_train_loop(args, device):
             "balanced_sampler": _balanced_sampler_mode(args),
             "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
             "edl_focal_gamma": getattr(args, "edl_focal_gamma", 0.0),
+            "prediction_aggregation": _prediction_aggregation_config(args),
+            "best_metric_name": _best_metric_name(args),
             "best_checkpoint_path": str(_fold_best_model_path(args)),
             "last_checkpoint_path": str(_fold_last_checkpoint_path(args)),
             "metrics_csv": str(_metrics_csv_path(args)),
@@ -957,16 +1089,18 @@ def edl_train_loop(args, device):
             valid_loader, model, criterion, args, device, epoch, logger=logger
         )
         avg_val_loss = valid_stats["loss"]
-        args.valid_folds = attach_patient_mean_predictions(
+        args.valid_folds = _attach_prediction_scores(
+            args,
             args.valid_folds,
             predictions,
             image_score_col='image_prediction_prob',
         )
 
-        valid_agg = patient_level_aggregate(args.valid_folds, args.label, 'prediction_prob')
+        valid_agg = _aggregate_prediction_scores(args, args.valid_folds, args.label, 'prediction_prob')
         aucroc_val = auroc(valid_agg[args.label].values.astype(int), valid_agg['prediction_prob'].values)
-        patient_diag = _threshold_diagnostics(valid_agg, args.label, "prediction_prob", "eval_patient")
-        image_diag = _threshold_diagnostics(args.valid_folds, args.label, "image_prediction_prob", "eval_image")
+        threshold = _prediction_threshold(args)
+        patient_diag = _threshold_diagnostics(valid_agg, args.label, "prediction_prob", "eval_patient", threshold)
+        image_diag = _threshold_diagnostics(args.valid_folds, args.label, "image_prediction_prob", "eval_image", threshold)
         elapsed = time.time() - start_time
 
         print(
@@ -1011,6 +1145,7 @@ def edl_train_loop(args, device):
             "train_annealing_coef": train_stats["annealing_coef"],
             "train_focal_factor_mean": train_stats["focal_factor_mean"],
             "train_sample_weight_mean": train_stats["sample_weight_mean"],
+            "train_focal_weighted_denominator": train_stats["focal_weighted_denominator"],
             "train_skipped_batches": train_stats["skipped_batches"],
             "eval_data_loss": valid_stats["data_loss"],
             "eval_unweighted_data_loss": valid_stats["unweighted_data_loss"],
@@ -1021,18 +1156,31 @@ def edl_train_loop(args, device):
             "eval_annealing_coef": valid_stats["annealing_coef"],
             "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
             "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
+            "eval_focal_weighted_denominator": valid_stats["focal_weighted_denominator"],
             "eval_skipped_batches": valid_stats["skipped_batches"],
+            "prediction_threshold": threshold,
+            "prediction_score_agg": _prediction_score_agg(args),
+            "prediction_group_cols": ",".join(_prediction_group_cols(args)),
+            "best_metric_name": _best_metric_name(args),
         }
         history_values.update(patient_diag)
         history_values.update(image_diag)
+        history_values.update({f"train_{key}": value for key, value in train_stats.items() if key.startswith("label")})
+        history_values.update({f"eval_{key}": value for key, value in valid_stats.items() if key.startswith("label")})
         history_values.update({key: value for key, value in train_stats.items() if key.startswith("train_")})
         history_values.update({key: value for key, value in valid_stats.items() if key.startswith("eval_")})
+        best_metric_name = _best_metric_name(args)
+        best_metric_value = _current_best_metric_value(args, history_values, aucroc_val)
+        history_values["selected_best_metric_value"] = best_metric_value
         _append_epoch_history(history, epoch + 1, history_values)
 
-        if epoch == 0 or best_aucroc < aucroc_val:
-            best_aucroc = aucroc_val
+        if np.isfinite(best_metric_value) and (epoch == 0 or best_aucroc < best_metric_value):
+            best_aucroc = best_metric_value
             epochs_no_improve = 0
-            print(f'Epoch {epoch + 1} - Save Best AUC-ROC: {best_aucroc:.4f} Model')
+            print(
+                f'Epoch {epoch + 1} - Save Best {best_metric_name}: {best_aucroc:.4f} '
+                f'(AUC-ROC: {aucroc_val:.4f}) Model'
+            )
             torch.save(
                 {
                     'model': model.state_dict(),
@@ -1042,7 +1190,10 @@ def edl_train_loop(args, device):
                     'predictions': predictions,
                     'epoch': epoch,
                     'auroc': aucroc_val,
-                    'best_aucroc': best_aucroc,
+                    'best_aucroc': aucroc_val,
+                    'best_metric_name': best_metric_name,
+                    'best_metric_value': best_aucroc,
+                    'prediction_aggregation': _prediction_aggregation_config(args),
                     'epochs_no_improve': epochs_no_improve,
                     'history': history,
                     'train_mode': getattr(args, "train_mode", "full"),
@@ -1058,15 +1209,16 @@ def edl_train_loop(args, device):
 
         if annealing_complete and args.patience > 0 and epochs_no_improve >= args.patience:
             print(f'Early stopping at epoch {epoch + 1}: no improvement for {args.patience} epochs, '
-                  f'best AUC-ROC: {best_aucroc:.4f}')
+                  f'best {_best_metric_name(args)}: {best_aucroc:.4f}')
             break
 
-        print(f'[Fold{args.cur_fold}], Best AUC-ROC: {best_aucroc:.4f}')
+        print(f'[Fold{args.cur_fold}], Best {_best_metric_name(args)}: {best_aucroc:.4f}')
 
     best_model_path = _fold_best_model_path(args)
     if best_model_path.exists():
         predictions = torch.load(best_model_path, map_location='cpu', weights_only=False)['predictions']
-        args.valid_folds = attach_patient_mean_predictions(
+        args.valid_folds = _attach_prediction_scores(
+            args,
             args.valid_folds,
             predictions,
             image_score_col='image_prediction_prob',
@@ -1196,7 +1348,8 @@ def edl_predict_on_dataset(args, df, model_path, device, fold):
 
     result_df['total_uncertainty'] = uncertainty_array.flatten()
     # 正类概率（类�?），兼容原有格式
-    result_df = attach_patient_mean_predictions(
+    result_df = _attach_prediction_scores(
+        args,
         result_df,
         probs_array[:, -1],
         image_score_col='image_prediction_prob',

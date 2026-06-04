@@ -45,6 +45,10 @@ BALANCED_SAMPLER = "none"
 CLASS_WEIGHT_MODE = None
 EFFECTIVE_BETA = 0.9999
 EDL_FOCAL_GAMMA = 0.0
+PREDICTION_GROUP_COLS = "patient_id"
+PREDICTION_SCORE_AGG = "mean"
+PREDICTION_THRESHOLD = 0.5
+EDL_BEST_METRIC = "eval_aucroc"
 
 IMG_SIZE = [912, 1520]
 
@@ -149,6 +153,31 @@ def build_parser():
         type=float,
         default=EDL_FOCAL_GAMMA,
         help="Focal gamma applied to EDL data loss. 0.0 disables focal loss.",
+    )
+    parser.add_argument(
+        "--prediction-group-cols",
+        default=PREDICTION_GROUP_COLS,
+        help="Comma-separated columns used to aggregate image probabilities, e.g. patient_id,laterality.",
+    )
+    parser.add_argument(
+        "--prediction-score-agg",
+        choices=["mean", "max"],
+        default=PREDICTION_SCORE_AGG,
+        help="How to aggregate image probabilities within prediction groups.",
+    )
+    parser.add_argument(
+        "--prediction-threshold",
+        type=float,
+        default=PREDICTION_THRESHOLD,
+        help="Threshold used for prediction_label and threshold diagnostics.",
+    )
+    parser.add_argument(
+        "--edl-best-metric",
+        default=EDL_BEST_METRIC,
+        help=(
+            "Metric used to save the best Prototype EDL checkpoint. Examples: eval_aucroc, "
+            "eval_patient_bacc_at_0_5, eval_image_bacc_at_0_5."
+        ),
     )
     parser.add_argument("--img-size", nargs=2, type=int, default=IMG_SIZE, metavar=("WIDTH", "HEIGHT"))
     parser.add_argument("--device", default=DEVICE, help="Training device, e.g. cuda or cpu.")
@@ -298,6 +327,8 @@ def main():
         raise ValueError("--edl-focal-gamma must be non-negative.")
     if cli_args.effective_beta < 0 or cli_args.effective_beta >= 1:
         raise ValueError("--effective-beta must be in [0, 1).")
+    if cli_args.prediction_threshold < 0 or cli_args.prediction_threshold > 1:
+        raise ValueError("--prediction-threshold must be in [0, 1].")
     if cli_args.edl_proto_k <= 0:
         raise ValueError("--edl-proto-k must be positive.")
     if cli_args.edl_proto_topk <= 0:
@@ -434,6 +465,10 @@ def main():
     args.class_weight_mode = cli_args.class_weight_mode
     args.effective_beta = cli_args.effective_beta
     args.edl_focal_gamma = cli_args.edl_focal_gamma
+    args.prediction_group_cols = cli_args.prediction_group_cols
+    args.prediction_score_agg = cli_args.prediction_score_agg
+    args.prediction_threshold = cli_args.prediction_threshold
+    args.edl_best_metric = cli_args.edl_best_metric
     args.train_mode = cli_args.train_mode
     args.freeze_backbone = "y" if args.train_mode == "head_only" else "n"
     args.resume = cli_args.resume
@@ -470,6 +505,13 @@ def main():
         balance_suffix_parts.append(f"beta_{args.effective_beta:g}")
     if args.edl_focal_gamma > 0:
         balance_suffix_parts.append(f"focal_g{args.edl_focal_gamma:g}")
+    if args.prediction_group_cols != PREDICTION_GROUP_COLS or args.prediction_score_agg != PREDICTION_SCORE_AGG:
+        group_suffix = args.prediction_group_cols.replace(",", "-")
+        balance_suffix_parts.append(f"agg_{group_suffix}_{args.prediction_score_agg}")
+    if args.prediction_threshold != PREDICTION_THRESHOLD:
+        balance_suffix_parts.append(f"thr_{args.prediction_threshold:g}")
+    if args.edl_best_metric != EDL_BEST_METRIC:
+        balance_suffix_parts.append(f"best_{args.edl_best_metric}")
     balance_suffix = f"_{'_'.join(balance_suffix_parts)}" if balance_suffix_parts else ""
 
     base_root = (
@@ -521,6 +563,10 @@ def main():
     print(f"class_weight_mode: {args.class_weight_mode or 'auto'}")
     print(f"effective_beta: {args.effective_beta}")
     print(f"edl_focal_gamma: {args.edl_focal_gamma}")
+    print(f"prediction_group_cols: {args.prediction_group_cols}")
+    print(f"prediction_score_agg: {args.prediction_score_agg}")
+    print(f"prediction_threshold: {args.prediction_threshold}")
+    print(f"edl_best_metric: {args.edl_best_metric}")
     print(f"train_mode: {args.train_mode}")
     print(f"freeze_backbone: {args.freeze_backbone}")
     print(f"resume: {args.resume}")

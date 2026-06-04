@@ -39,6 +39,46 @@ def _normalized_split(df):
     return df["split"].astype(str).str.strip().str.lower()
 
 
+def _prediction_group_cols(args):
+    group_cols = getattr(args, "prediction_group_cols", "patient_id")
+    if isinstance(group_cols, str):
+        group_cols = [col.strip() for col in group_cols.split(",") if col.strip()]
+    else:
+        group_cols = [str(col).strip() for col in group_cols if str(col).strip()]
+    return group_cols or ["patient_id"]
+
+
+def _prediction_score_agg(args):
+    score_agg = str(getattr(args, "prediction_score_agg", "mean") or "mean").strip().lower()
+    if score_agg not in {"mean", "max"}:
+        raise ValueError(f"Unsupported prediction_score_agg: {score_agg}. Use mean or max.")
+    return score_agg
+
+
+def _prediction_threshold(args):
+    return float(getattr(args, "prediction_threshold", 0.5))
+
+
+def _aggregate_prediction_scores(args, df, label_col, score_col):
+    return patient_level_aggregate(
+        df,
+        label_col,
+        score_col,
+        group_cols=_prediction_group_cols(args),
+        score_agg=_prediction_score_agg(args),
+    )
+
+
+def _attach_prediction_scores(args, df, scores):
+    return attach_patient_mean_predictions(
+        df,
+        scores,
+        group_cols=_prediction_group_cols(args),
+        score_agg=_prediction_score_agg(args),
+        threshold=_prediction_threshold(args),
+    )
+
+
 def _build_fold_split_view(df, fold, n_folds):
     fold_view = df.copy()
     if "split" not in fold_view.columns:
@@ -301,10 +341,7 @@ def do_experiments(args, device):
 
     if len(predict_df) > 0 and len(fold_prediction_arrays) > 0:
         ensemble_predictions = np.mean(fold_prediction_arrays, axis=0)
-        ensemble_output = predict_df.copy()
-        ensemble_output["patient_prediction_prob"] = ensemble_predictions
-        ensemble_output["prediction_prob"] = ensemble_predictions
-        ensemble_output["prediction_label"] = (ensemble_predictions >= 0.5).astype(int)
+        ensemble_output = _attach_prediction_scores(args, predict_df.copy(), ensemble_predictions)
         ensemble_csv_path = args.output_path / "ensemble_all_predictions.csv"
         ensemble_output.to_csv(ensemble_csv_path, index=False)
         print(f"\nEnsemble all-data predictions saved to: {ensemble_csv_path}")
@@ -451,7 +488,7 @@ def train_loop(args, device):
             else:
                 epochs_no_improve += 1
         else:
-            valid_agg = patient_level_aggregate(args.valid_folds, args.label, "prediction")
+            valid_agg = _aggregate_prediction_scores(args, args.valid_folds, args.label, "prediction")
             aucroc_value = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction"].values)
             elapsed = time.time() - start_time
             print(
@@ -528,7 +565,7 @@ def inference_loop(args):
     print(f"predictions: {predictions.shape} {type(predictions)}")
     args.valid_folds["prediction"] = predictions
 
-    valid_agg = patient_level_aggregate(args.valid_folds, args.label, "prediction")
+    valid_agg = _aggregate_prediction_scores(args, args.valid_folds, args.label, "prediction")
     aucroc_value = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction"].values)
     print(f"Fold {args.cur_fold} AUC-ROC: {aucroc_value:.4f}")
     metrics_df = _save_fold_metrics(
@@ -595,7 +632,7 @@ def predict_on_dataset(args, df, model_path, device, fold):
 
     predictions = np.concatenate(preds)
 
-    predict_output = attach_patient_mean_predictions(df, predictions)
+    predict_output = _attach_prediction_scores(args, df, predictions)
     predictions_agg = predict_output["prediction_prob"].values
 
     print(

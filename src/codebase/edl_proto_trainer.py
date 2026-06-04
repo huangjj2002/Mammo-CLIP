@@ -29,16 +29,22 @@ from breastclip.scheduler import LinearWarmupCosineAnnealingLR
 from edl_loss import EDLLoss
 from edl_proto_model import BreastClipPrototypeEDLClassifier
 from edl_trainer import (
+    _aggregate_prediction_scores,
     _amp_enabled,
     _append_epoch_history,
     _append_skip_log,
     _assert_finite_tensor,
+    _attach_prediction_scores,
+    _best_metric_column,
+    _best_metric_name,
     _class_weight_mode,
+    _current_best_metric_value,
     _cuda_postfix,
     _edl_annealing_gate_visible_epoch,
     _evidence_store,
     _evidence_summary,
     _is_edl_annealing_complete,
+    _load_best_metric_value_from_checkpoint,
     _compute_fold_class_weights,
     _empty_cuda_cache,
     _filter_valid_subbatch,
@@ -46,7 +52,12 @@ from edl_trainer import (
     _loss_component_meters,
     _loss_component_summary,
     _placeholder_prediction_batch,
+    _prediction_aggregation_config,
+    _prediction_group_cols,
+    _prediction_score_agg,
+    _prediction_threshold,
     _record_evidence_batch,
+    _threshold_diagnostics,
     _update_loss_component_meters,
     _valid_indices_from_fallback_flags,
     edl_get_dataloader,
@@ -56,8 +67,6 @@ from metrics import auroc
 from utils import (
     AverageMeter,
     audit_laterality_label_mixes,
-    attach_patient_mean_predictions,
-    patient_level_aggregate,
     seed_all,
     timeSince,
 )
@@ -137,6 +146,8 @@ def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
         "epoch": epoch,
         "best_aucroc": best_aucroc,
+        "best_metric_name": _best_metric_name(args),
+        "best_metric_value": best_aucroc,
         "epochs_no_improve": epochs_no_improve,
         "history": history,
         "train_mode": getattr(args, "train_mode", "full"),
@@ -172,13 +183,13 @@ def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler
         scaler.load_state_dict(checkpoint["scaler"])
     history = _ensure_proto_history_keys(checkpoint.get("history", history))
     start_epoch = int(checkpoint.get("epoch", -1)) + 1
-    best_aucroc = float(checkpoint.get("best_aucroc", 0.0))
+    best_aucroc = _load_best_metric_value_from_checkpoint(args, checkpoint, default=0.0)
     epochs_no_improve = int(checkpoint.get("epochs_no_improve", 0))
     if not _is_edl_annealing_complete(args, int(checkpoint.get("epoch", -1))):
         epochs_no_improve = 0
     print(
         f"Resumed prototype EDL fold {args.cur_fold} from {checkpoint_path} "
-        f"(next_epoch={start_epoch + 1}, best_aucroc={best_aucroc:.4f})"
+        f"(next_epoch={start_epoch + 1}, best_{_best_metric_name(args)}={best_aucroc:.4f})"
     )
     if not _is_edl_annealing_complete(args, start_epoch - 1):
         print(
@@ -235,7 +246,8 @@ def _record_fold_summary(args, metrics_df, summaries):
     if metrics_df.empty:
         return
 
-    best_idx = metrics_df["eval_aucroc"].idxmax()
+    metric_col = _best_metric_column(args, metrics_df)
+    best_idx = metrics_df[metric_col].idxmax()
     best_row = metrics_df.loc[best_idx]
     summaries.append(
         {
@@ -243,6 +255,8 @@ def _record_fold_summary(args, metrics_df, summaries):
             "eval_split": best_row["eval_split"],
             "best_epoch": int(best_row["epoch"]),
             "best_aucroc": float(best_row["eval_aucroc"]),
+            "best_metric_name": metric_col,
+            "best_metric_value": float(best_row[metric_col]),
             "checkpoint_path": str(_fold_best_model_path(args)),
             "metrics_csv": str(_metrics_csv_path(args)),
         }
@@ -645,7 +659,7 @@ def do_prototype_edl_experiments(args, device):
     if args.n_folds > 0 and len(oof_df) > 0:
         oof_df = oof_df.reset_index(drop=True)
         print("\n================ Prototype EDL CV (Out-of-Fold) ================")
-        oof_agg = patient_level_aggregate(oof_df, args.label, "prediction_prob")
+        oof_agg = _aggregate_prediction_scores(args, oof_df, args.label, "prediction_prob")
         aucroc_val = auroc(gt=oof_agg[args.label].values.astype(int), pred=oof_agg["prediction_prob"].values)
         print(f"OOF AUC-ROC: {aucroc_val:.4f}")
         oof_df.to_csv(
@@ -663,12 +677,13 @@ def do_prototype_edl_experiments(args, device):
         for col in all_evidence_cols + all_alpha_cols + all_prob_cols + ["total_uncertainty", image_score_col]:
             ensemble_output[col] = np.mean([fd[col].values for fd in fold_prediction_arrays], axis=0)
 
-        ensemble_output = attach_patient_mean_predictions(
+        ensemble_output = _attach_prediction_scores(
+            args,
             ensemble_output,
             ensemble_output[image_score_col].values,
             image_score_col=image_score_col,
         )
-        ensemble_output["prediction_label"] = (ensemble_output["prediction_prob"] >= 0.5).astype(int)
+        ensemble_output["prediction_label"] = (ensemble_output["prediction_prob"] >= _prediction_threshold(args)).astype(int)
         ensemble_output["prediction_score"] = ensemble_output["prediction_prob"]
         ensemble_output["predicted_class"] = ensemble_output["prediction_label"]
         ensemble_output["uncertainty"] = ensemble_output["total_uncertainty"]
@@ -768,22 +783,30 @@ def prototype_edl_train_loop(args, device):
             valid_loader, model, criterion, args, device, epoch, logger=logger
         )
         avg_val_loss = valid_stats["loss"]
-        args.valid_folds = attach_patient_mean_predictions(
+        args.valid_folds = _attach_prediction_scores(
+            args,
             args.valid_folds,
             predictions,
             image_score_col="image_prediction_prob",
         )
 
-        valid_agg = patient_level_aggregate(args.valid_folds, args.label, "prediction_prob")
+        valid_agg = _aggregate_prediction_scores(args, args.valid_folds, args.label, "prediction_prob")
         aucroc_val = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction_prob"].values)
+        threshold = _prediction_threshold(args)
+        patient_diag = _threshold_diagnostics(valid_agg, args.label, "prediction_prob", "eval_patient", threshold)
+        image_diag = _threshold_diagnostics(args.valid_folds, args.label, "image_prediction_prob", "eval_image", threshold)
         elapsed = time.time() - start_time
 
         print(
             f"Epoch {epoch + 1} - avg_train_loss: {avg_loss:.4f}  avg_{eval_name}_loss: {avg_val_loss:.4f}  "
             f"proto_loss: {train_loss_stats['prototype_loss']:.4f}  "
-            f"proto_raw: {train_loss_stats['prototype_loss_raw']:.4f}  AUC-ROC: {aucroc_val:.4f}  time: {elapsed:.0f}s"
+            f"proto_raw: {train_loss_stats['prototype_loss_raw']:.4f}  AUC-ROC: {aucroc_val:.4f}  "
+            f"BACC@0.5: {patient_diag['eval_patient_bacc_at_0_5']:.4f}  "
+            f"Pred_Pos@0.5: {patient_diag['eval_patient_pred_pos_at_0_5']}  time: {elapsed:.0f}s"
         )
         logger.add_scalar(f"{eval_name}/{args.label}/AUC-ROC", aucroc_val, epoch + 1)
+        logger.add_scalar(f"{eval_name}/{args.label}/BACC@0.5", patient_diag["eval_patient_bacc_at_0_5"], epoch + 1)
+        logger.add_scalar(f"{eval_name}/{args.label}/Pred_Pos@0.5", patient_diag["eval_patient_pred_pos_at_0_5"], epoch + 1)
         logger.add_scalar("train/epoch_loss", avg_loss, epoch + 1)
         logger.add_scalar("train/epoch_edl_loss", train_loss_stats["edl_loss"], epoch + 1)
         logger.add_scalar("train/epoch_proto_loss", train_loss_stats["prototype_loss"], epoch + 1)
@@ -813,20 +836,36 @@ def prototype_edl_train_loop(args, device):
             "eval_annealing_coef": valid_stats["annealing_coef"],
             "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
             "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
+            "eval_focal_weighted_denominator": valid_stats["focal_weighted_denominator"],
             "eval_skipped_batches": valid_stats["skipped_batches"],
+            "prediction_threshold": threshold,
+            "prediction_score_agg": _prediction_score_agg(args),
+            "prediction_group_cols": ",".join(_prediction_group_cols(args)),
+            "best_metric_name": _best_metric_name(args),
         }
+        history_values.update(patient_diag)
+        history_values.update(image_diag)
+        history_values.update({f"eval_{key}": value for key, value in valid_stats.items() if key.startswith("label")})
         for key, value in train_loss_stats.items():
             if key.startswith("edl_"):
                 history_values[f"train_{key}"] = value
             elif key.startswith("train_"):
                 history_values[key] = value
+            elif key.startswith("label"):
+                history_values[f"train_{key}"] = value
         history_values.update({key: value for key, value in valid_stats.items() if key.startswith("eval_")})
+        best_metric_name = _best_metric_name(args)
+        best_metric_value = _current_best_metric_value(args, history_values, aucroc_val)
+        history_values["selected_best_metric_value"] = best_metric_value
         _append_epoch_history(history, epoch + 1, history_values)
 
-        if epoch == 0 or best_aucroc < aucroc_val:
-            best_aucroc = aucroc_val
+        if np.isfinite(best_metric_value) and (epoch == 0 or best_aucroc < best_metric_value):
+            best_aucroc = best_metric_value
             epochs_no_improve = 0
-            print(f"Epoch {epoch + 1} - Save Best AUC-ROC: {best_aucroc:.4f} Prototype EDL Model")
+            print(
+                f"Epoch {epoch + 1} - Save Best {best_metric_name}: {best_aucroc:.4f} "
+                f"(AUC-ROC: {aucroc_val:.4f}) Prototype EDL Model"
+            )
             torch.save(
                 {
                     "model": model.state_dict(),
@@ -836,7 +875,10 @@ def prototype_edl_train_loop(args, device):
                     "predictions": predictions,
                     "epoch": epoch,
                     "auroc": aucroc_val,
-                    "best_aucroc": best_aucroc,
+                    "best_aucroc": aucroc_val,
+                    "best_metric_name": best_metric_name,
+                    "best_metric_value": best_aucroc,
+                    "prediction_aggregation": _prediction_aggregation_config(args),
                     "epochs_no_improve": epochs_no_improve,
                     "history": history,
                     "train_mode": getattr(args, "train_mode", "full"),
@@ -861,16 +903,17 @@ def prototype_edl_train_loop(args, device):
         if annealing_complete and args.patience > 0 and epochs_no_improve >= args.patience:
             print(
                 f"Early stopping at epoch {epoch + 1}: no improvement for {args.patience} epochs, "
-                f"best AUC-ROC: {best_aucroc:.4f}"
+                f"best {_best_metric_name(args)}: {best_aucroc:.4f}"
             )
             break
 
-        print(f"[Fold{args.cur_fold}], Best AUC-ROC: {best_aucroc:.4f}")
+        print(f"[Fold{args.cur_fold}], Best {_best_metric_name(args)}: {best_aucroc:.4f}")
 
     best_model_path = _fold_best_model_path(args)
     if best_model_path.exists():
         predictions = torch.load(best_model_path, map_location="cpu", weights_only=False)["predictions"]
-        args.valid_folds = attach_patient_mean_predictions(
+        args.valid_folds = _attach_prediction_scores(
+            args,
             args.valid_folds,
             predictions,
             image_score_col="image_prediction_prob",
@@ -1019,7 +1062,8 @@ def prototype_edl_predict_on_dataset(args, df, model_path, device, fold):
         result_df[f"probability_{i}"] = probs_array[:, i]
 
     result_df["total_uncertainty"] = uncertainty_array.flatten()
-    result_df = attach_patient_mean_predictions(
+    result_df = _attach_prediction_scores(
+        args,
         result_df,
         probs_array[:, -1],
         image_score_col="image_prediction_prob",

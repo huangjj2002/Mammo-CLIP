@@ -66,17 +66,36 @@ def append_run_id(root, run_id=None):
     return f"{root}_run_{resolved_run_id}", resolved_run_id
 
 
-def patient_level_aggregate(df, label_col, score_col, group_col="patient_id"):
-    missing = [col for col in (group_col, label_col, score_col) if col not in df.columns]
+def _normalize_group_cols(group_col="patient_id", group_cols=None):
+    if group_cols is None:
+        group_cols = group_col
+    if isinstance(group_cols, str):
+        group_cols = [col.strip() for col in group_cols.split(",") if col.strip()]
+    else:
+        group_cols = [str(col).strip() for col in group_cols if str(col).strip()]
+    return group_cols or ["patient_id"]
+
+
+def _normalize_score_agg(score_agg):
+    score_agg = str(score_agg or "mean").strip().lower()
+    if score_agg not in {"mean", "max"}:
+        raise ValueError(f"Unsupported score aggregation: {score_agg}. Use mean or max.")
+    return score_agg
+
+
+def patient_level_aggregate(df, label_col, score_col, group_col="patient_id", group_cols=None, score_agg="mean"):
+    group_cols = _normalize_group_cols(group_col=group_col, group_cols=group_cols)
+    score_agg = _normalize_score_agg(score_agg)
+    missing = [col for col in (*group_cols, label_col, score_col) if col not in df.columns]
     if missing:
         raise KeyError(f"Missing column(s) for patient-level aggregation: {missing}")
 
     if df.empty:
-        return pd.DataFrame(columns=[group_col, label_col, score_col])
+        return pd.DataFrame(columns=[*group_cols, label_col, score_col])
 
     return (
-        df.groupby(group_col)
-        .agg({label_col: "max", score_col: "mean"})
+        df.groupby(group_cols, dropna=False)
+        .agg({label_col: "max", score_col: score_agg})
         .reset_index()
     )
 
@@ -89,16 +108,25 @@ def attach_patient_mean_predictions(
     output_score_col="prediction_prob",
     label_col="prediction_label",
     group_col="patient_id",
+    group_cols=None,
+    score_agg="mean",
     threshold=0.5,
 ):
-    if group_col not in df.columns:
-        raise KeyError(f"Missing column for patient-level prediction aggregation: {group_col}")
+    group_cols = _normalize_group_cols(group_col=group_col, group_cols=group_cols)
+    score_agg = _normalize_score_agg(score_agg)
+    missing = [col for col in group_cols if col not in df.columns]
+    if missing:
+        raise KeyError(f"Missing column(s) for prediction aggregation: {missing}")
 
     result_df = df.copy()
     result_df[image_score_col] = np.asarray(image_scores)
-    result_df[patient_score_col] = result_df.groupby(group_col)[image_score_col].transform("mean")
+    result_df[patient_score_col] = result_df.groupby(group_cols, dropna=False)[image_score_col].transform(score_agg)
     result_df[output_score_col] = result_df[patient_score_col]
     result_df[label_col] = (result_df[output_score_col] >= threshold).astype(int)
+    result_df["prediction_group_cols"] = ",".join(group_cols)
+    result_df["prediction_score_agg"] = score_agg
+    result_df["prediction_threshold"] = float(threshold)
+    result_df["prediction_image_score_col"] = image_score_col
     return result_df
 
 
