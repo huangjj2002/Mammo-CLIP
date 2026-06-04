@@ -11,6 +11,8 @@ Evidential Deep Learning (EDL) 训练/验证/测试模块
 import gc
 import json
 import math
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from breastclip.scheduler import LinearWarmupCosineAnnealingLR
 from metrics import auroc
 from utils import (
     AverageMeter,
+    append_run_id,
     audit_laterality_label_mixes,
     attach_patient_mean_predictions,
     patient_level_aggregate,
@@ -92,6 +95,16 @@ def _fold_best_model_path(args):
 
 def _fold_last_checkpoint_path(args):
     model_name = f'edl_{args.model_base_name}_seed_{args.seed}_fold{args.cur_fold}_last.pth'
+    return args.chk_pt_path / model_name
+
+
+def _training_schedule(args):
+    return str(getattr(args, "edl_training_schedule", "joint") or "joint").strip().lower()
+
+
+def _fold_stage_best_checkpoint_path(args, stage_name):
+    safe_stage = str(stage_name).replace(" ", "_")
+    model_name = f"edl_{args.model_base_name}_seed_{args.seed}_fold{args.cur_fold}_{safe_stage}_stage_best.pth"
     return args.chk_pt_path / model_name
 
 
@@ -355,6 +368,13 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
         "prediction_score_agg",
         "prediction_threshold",
         "edl_best_metric",
+        "edl_training_schedule",
+        "bce_warmstart_path",
+        "bce_stage_epochs",
+        "bce_stage_lr",
+        "bce_stage_patience",
+        "edl_stage_patience",
+        "staged_freeze_encoder",
         "num_classes",
         "label",
         "patience",
@@ -673,18 +693,34 @@ def _load_last_checkpoint_if_available(args, model, optimizer, scheduler, scaler
     return start_epoch, best_aucroc, epochs_no_improve, history
 
 
-def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best_aucroc, epochs_no_improve, history):
+def _save_last_checkpoint(
+    args,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch,
+    best_aucroc,
+    epochs_no_improve,
+    history,
+    stage_name="joint",
+    stage_epoch=None,
+):
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
         "epoch": epoch,
+        "stage": stage_name,
+        "stage_epoch": stage_epoch,
         "best_aucroc": best_aucroc,
         "best_metric_name": _best_metric_name(args),
         "best_metric_value": best_aucroc,
         "epochs_no_improve": epochs_no_improve,
         "history": history,
+        "training_schedule": _training_schedule(args),
+        "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
         "train_mode": getattr(args, "train_mode", "full"),
         "freeze_backbone": getattr(args, "freeze_backbone", "n"),
     }
@@ -821,6 +857,171 @@ def _save_fold_metrics_csv(args, history, eval_split):
     return metrics_df
 
 
+def _stage_patience(args, stage_name, default=None):
+    if stage_name == "edl_head":
+        return int(getattr(args, "edl_stage_patience", getattr(args, "patience", default if default is not None else 0)))
+    if stage_name == "joint":
+        return int(getattr(args, "patience", default if default is not None else 0))
+    return int(default if default is not None else 0)
+
+
+def _auto_bce_run_id(args):
+    return f"{getattr(args, 'run_id', 'edl')}_bce_warmstart"
+
+
+def _auto_bce_root(args):
+    base_root = (
+        f"lr_{args.bce_stage_lr}_epochs_{args.bce_stage_epochs}_weighted_BCE_{args.weighted_BCE}_"
+        f"{args.label}_data_frac_{getattr(args, 'data_frac', 1.0)}"
+    )
+    root, _ = append_run_id(base_root, _auto_bce_run_id(args))
+    return root
+
+
+def _auto_bce_checkpoint_dir(args):
+    return Path(args.checkpoints) / args.dataset / "classifier" / args.arch / _auto_bce_root(args)
+
+
+def _bce_checkpoint_candidates(path, fold):
+    if not path.exists():
+        return []
+    patterns = [f"*fold{fold}_best_aucroc*.pth", f"*fold{fold}_best_acc*.pth"]
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(path.glob(pattern))
+    if not candidates:
+        for pattern in patterns:
+            candidates.extend(path.rglob(pattern))
+    unique = {str(candidate.resolve()): candidate for candidate in candidates}
+    return sorted(unique.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _resolve_bce_warmstart_path(args, fold):
+    path_value = getattr(args, "bce_warmstart_path", None)
+    if not path_value:
+        raise ValueError("staged EDL needs a BCE warm-start path after Stage 1 setup.")
+
+    path_text = str(path_value)
+    if "{fold}" in path_text:
+        path_text = path_text.format(fold=fold)
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = Path(getattr(args, "project_root", Path.cwd())) / path
+
+    if path.is_file():
+        resolved = path
+    elif path.is_dir():
+        candidates = _bce_checkpoint_candidates(path, fold)
+        if not candidates:
+            raise FileNotFoundError(f"No BCE checkpoint matching fold{fold} found in {path}.")
+        if len(candidates) > 1:
+            print(f"[WARN] Multiple BCE checkpoints found for fold{fold}; using newest: {candidates[0]}")
+        resolved = candidates[0]
+    else:
+        raise FileNotFoundError(f"BCE warm-start path does not exist: {path}")
+
+    args._resolved_bce_warmstart_path = str(resolved)
+    return resolved
+
+
+def _run_bce_warmstart_training(args):
+    codebase_dir = Path(getattr(args, "codebase_dir", Path(__file__).parent))
+    train_script = codebase_dir / "train_classifier.py"
+    cmd = [
+        sys.executable,
+        str(train_script),
+        "--tensorboard-path",
+        str(args.tensorboard_path),
+        "--checkpoints",
+        str(args.checkpoints),
+        "--output_path",
+        str(args.output_path),
+        "--data-dir",
+        str(args.data_dir),
+        "--img-dir",
+        str(args.img_dir),
+        "--clip_chk_pt_path",
+        str(args.clip_chk_pt_path),
+        "--csv-file",
+        str(args.csv_file),
+        "--dataset",
+        str(args.dataset),
+        "--data_frac",
+        str(getattr(args, "data_frac", 1.0)),
+        "--arch",
+        str(args.arch),
+        "--label",
+        str(args.label),
+        "--VER",
+        "bce_warmstart",
+        "--n_folds",
+        str(args.n_folds),
+        "--seed",
+        str(args.seed),
+        "--batch-size",
+        str(args.batch_size),
+        "--num-workers",
+        str(args.num_workers),
+        "--epochs",
+        str(args.bce_stage_epochs),
+        "--lr",
+        str(args.bce_stage_lr),
+        "--weight-decay",
+        str(args.weight_decay),
+        "--warmup-epochs",
+        str(args.warmup_epochs),
+        "--img-size",
+        *[str(size) for size in args.img_size],
+        "--device",
+        str(args.device),
+        "--apex",
+        "y" if getattr(args, "apex", False) else "n",
+        "--print-freq",
+        str(args.print_freq),
+        "--log-freq",
+        str(args.log_freq),
+        "--model-type",
+        "classifier",
+        "--weighted-BCE",
+        str(args.weighted_BCE),
+        "--patience",
+        str(args.bce_stage_patience),
+        "--balanced-dataloader",
+        str(getattr(args, "balanced_dataloader", "n")),
+        "--run-id",
+        _auto_bce_run_id(args),
+    ]
+    print("\n================ Stage 1: BCE warm-start training ================")
+    print("Running:", " ".join(cmd))
+    result = subprocess.run(cmd, cwd=str(codebase_dir))
+    if result.returncode != 0:
+        raise RuntimeError(f"BCE warm-start training failed with exit code {result.returncode}.")
+    checkpoint_dir = _auto_bce_checkpoint_dir(args)
+    print(f"BCE warm-start checkpoint directory: {checkpoint_dir}")
+    return checkpoint_dir
+
+
+def _ensure_bce_warmstart(args):
+    if _training_schedule(args) != "staged":
+        return None
+
+    if getattr(args, "bce_warmstart_path", None):
+        return Path(str(args.bce_warmstart_path))
+
+    checkpoint_dir = _auto_bce_checkpoint_dir(args)
+    missing_folds = []
+    for fold in _fold_indices(args):
+        if not _bce_checkpoint_candidates(checkpoint_dir, fold):
+            missing_folds.append(fold)
+    if missing_folds:
+        checkpoint_dir = _run_bce_warmstart_training(args)
+    else:
+        print(f"Reusing existing automatic BCE warm-start directory: {checkpoint_dir}")
+
+    args.bce_warmstart_path = str(checkpoint_dir)
+    return checkpoint_dir
+
+
 def _record_fold_summary(args, metrics_df, summaries):
     if metrics_df.empty:
         return
@@ -891,6 +1092,7 @@ def do_edl_experiments(args, device):
     oof_df = pd.DataFrame()
     fold_prediction_arrays = []
     fold_summaries = []
+    _ensure_bce_warmstart(args)
 
     for fold in _fold_indices(args):
         args.cur_fold = fold
@@ -977,10 +1179,361 @@ def do_edl_experiments(args, device):
 
     print("\n================ EDL Done! ================")
 
+
+def _create_edl_model(args, ckpt, device):
+    num_classes = args.num_classes
+    print(f"Creating EDL model with {num_classes} classes")
+    model = BreastClipEDLClassifier(
+        args,
+        ckpt=ckpt,
+        num_classes=num_classes,
+        dropout=args.edl_dropout,
+        hidden_dim=args.edl_hidden_dim,
+    )
+    return model.to(device)
+
+
+def _load_bce_warmstart_for_fold(args, model):
+    bce_checkpoint_path = _resolve_bce_warmstart_path(args, args.cur_fold)
+    checkpoint = torch.load(bce_checkpoint_path, map_location="cpu", weights_only=False)
+    loaded_count = model.load_bce_encoder_state(checkpoint, strict=True)
+    print(f"Loaded {loaded_count} image_encoder tensors from BCE warm-start: {bce_checkpoint_path}")
+    return bce_checkpoint_path
+
+
+def _build_stage_optimizer_scheduler(args, model, train_loader, stage_epochs, lr, device):
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_param_count = sum(param.numel() for param in trainable_params)
+    print(f"Trainable parameters: {trainable_param_count:,} / {total_params:,}")
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for this EDL stage.")
+
+    optimizer = AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+    if args.warmup_epochs == 1:
+        warmup_steps = len(train_loader)
+    elif args.warmup_epochs == 0.1:
+        warmup_steps = stage_epochs
+    else:
+        warmup_steps = 10
+    lr_config = {
+        "total_epochs": stage_epochs,
+        "warmup_steps": warmup_steps,
+        "total_steps": len(train_loader) * stage_epochs,
+    }
+    scheduler = LinearWarmupCosineAnnealingLR(optimizer, **lr_config)
+    scaler = torch.cuda.amp.GradScaler(enabled=_amp_enabled(args, device))
+    return optimizer, scheduler, scaler
+
+
+def _build_edl_criterion(args, class_weights):
+    return EDLLoss(
+        num_classes=args.num_classes,
+        loss_type=args.edl_loss_type,
+        kl_weight=args.edl_kl_weight,
+        annealing_start=args.edl_annealing_start,
+        annealing_epochs=args.edl_annealing_epochs,
+        class_weights=class_weights,
+        focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
+    )
+
+
+def _run_edl_stage(
+    args,
+    model,
+    train_loader,
+    valid_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    scaler,
+    logger,
+    device,
+    history,
+    eval_name,
+    stage_name,
+    stage_epochs,
+    best_aucroc,
+    epochs_no_improve,
+):
+    stage_patience = _stage_patience(args, stage_name)
+    stage_best_path = _fold_stage_best_checkpoint_path(args, stage_name)
+    stage_best_metric = float("-inf")
+    stage_no_improve = 0
+    best_metric_name = _best_metric_name(args)
+    print(
+        f"\n================ Stage: {stage_name} ({stage_epochs} epoch(s), "
+        f"patience={stage_patience}) ================"
+    )
+
+    for epoch in range(stage_epochs):
+        start_time = time.time()
+        criterion.current_epoch = epoch
+        annealing_complete = _is_edl_annealing_complete(args, epoch)
+        if not annealing_complete:
+            print(
+                f"Epoch {epoch + 1} [{stage_name}] - EDL annealing is active; "
+                f"stage early stopping still uses patience={stage_patience}."
+            )
+
+        train_stats = edl_train_fn(
+            train_loader, model, criterion, optimizer, epoch, args, scheduler, scaler, logger, device
+        )
+        avg_loss = train_stats["loss"]
+
+        valid_stats, predictions = edl_valid_fn(
+            valid_loader, model, criterion, args, device, epoch, logger=logger
+        )
+        avg_val_loss = valid_stats["loss"]
+        args.valid_folds = _attach_prediction_scores(
+            args,
+            args.valid_folds,
+            predictions,
+            image_score_col="image_prediction_prob",
+        )
+
+        valid_agg = _aggregate_prediction_scores(args, args.valid_folds, args.label, "prediction_prob")
+        aucroc_val = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction_prob"].values)
+        threshold = _prediction_threshold(args)
+        patient_diag = _threshold_diagnostics(valid_agg, args.label, "prediction_prob", "eval_patient", threshold)
+        image_diag = _threshold_diagnostics(args.valid_folds, args.label, "image_prediction_prob", "eval_image", threshold)
+        elapsed = time.time() - start_time
+
+        print(
+            f"Epoch {epoch + 1} [{stage_name}] - avg_train_loss: {avg_loss:.4f}  "
+            f"avg_{eval_name}_loss: {avg_val_loss:.4f}  AUC-ROC: {aucroc_val:.4f}  "
+            f"BACC@0.5: {patient_diag['eval_patient_bacc_at_0_5']:.4f}  "
+            f"Pred_Pos@0.5: {patient_diag['eval_patient_pred_pos_at_0_5']}  time: {elapsed:.0f}s"
+        )
+        logger.add_scalar(f"{eval_name}/{args.label}/AUC-ROC", aucroc_val, epoch + 1)
+        logger.add_scalar(f"{eval_name}/{args.label}/BACC@0.5", patient_diag["eval_patient_bacc_at_0_5"], epoch + 1)
+        logger.add_scalar(f"{eval_name}/{args.label}/Pred_Pos@0.5", patient_diag["eval_patient_pred_pos_at_0_5"], epoch + 1)
+        logger.add_scalar("train/epoch_loss", avg_loss, epoch + 1)
+        logger.add_scalar("valid/epoch_loss", avg_val_loss, epoch + 1)
+        logger.add_scalar("train/data_loss", train_stats["data_loss"], epoch + 1)
+        logger.add_scalar("train/unweighted_data_loss", train_stats["unweighted_data_loss"], epoch + 1)
+        logger.add_scalar("train/kl_loss", train_stats["kl_loss"], epoch + 1)
+        logger.add_scalar("valid/data_loss", valid_stats["data_loss"], epoch + 1)
+        logger.add_scalar("valid/unweighted_data_loss", valid_stats["unweighted_data_loss"], epoch + 1)
+        logger.add_scalar("valid/kl_loss", valid_stats["kl_loss"], epoch + 1)
+
+        history_values = {
+            "stage": stage_name,
+            "stage_epoch": epoch + 1,
+            "train_loss": avg_loss,
+            "valid_loss": avg_val_loss,
+            "valid_aucroc": aucroc_val,
+            "train_data_loss": train_stats["data_loss"],
+            "train_unweighted_data_loss": train_stats["unweighted_data_loss"],
+            "train_class_weighted_data_loss": train_stats["class_weighted_data_loss"],
+            "train_focal_data_loss": train_stats["focal_data_loss"],
+            "train_kl_loss": train_stats["kl_loss"],
+            "train_total_loss": train_stats["total_loss"],
+            "train_annealing_coef": train_stats["annealing_coef"],
+            "train_focal_factor_mean": train_stats["focal_factor_mean"],
+            "train_sample_weight_mean": train_stats["sample_weight_mean"],
+            "train_focal_weighted_denominator": train_stats["focal_weighted_denominator"],
+            "train_skipped_batches": train_stats["skipped_batches"],
+            "eval_data_loss": valid_stats["data_loss"],
+            "eval_unweighted_data_loss": valid_stats["unweighted_data_loss"],
+            "eval_class_weighted_data_loss": valid_stats["class_weighted_data_loss"],
+            "eval_focal_data_loss": valid_stats["focal_data_loss"],
+            "eval_kl_loss": valid_stats["kl_loss"],
+            "eval_total_loss": valid_stats["total_loss"],
+            "eval_annealing_coef": valid_stats["annealing_coef"],
+            "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
+            "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
+            "eval_focal_weighted_denominator": valid_stats["focal_weighted_denominator"],
+            "eval_skipped_batches": valid_stats["skipped_batches"],
+            "prediction_threshold": threshold,
+            "prediction_score_agg": _prediction_score_agg(args),
+            "prediction_group_cols": ",".join(_prediction_group_cols(args)),
+            "best_metric_name": best_metric_name,
+        }
+        history_values.update(patient_diag)
+        history_values.update(image_diag)
+        history_values.update({f"train_{key}": value for key, value in train_stats.items() if key.startswith("label")})
+        history_values.update({f"eval_{key}": value for key, value in valid_stats.items() if key.startswith("label")})
+        history_values.update({key: value for key, value in train_stats.items() if key.startswith("train_")})
+        history_values.update({key: value for key, value in valid_stats.items() if key.startswith("eval_")})
+        best_metric_value = _current_best_metric_value(args, history_values, aucroc_val)
+        history_values["selected_best_metric_value"] = best_metric_value
+        _append_epoch_history(history, epoch + 1, history_values)
+
+        improved = np.isfinite(best_metric_value) and (not np.isfinite(stage_best_metric) or stage_best_metric < best_metric_value)
+        if improved:
+            stage_best_metric = best_metric_value
+            stage_no_improve = 0
+            best_aucroc = best_metric_value
+            epochs_no_improve = 0
+            print(
+                f"Epoch {epoch + 1} - Save Best {best_metric_name}: {best_aucroc:.4f} "
+                f"(AUC-ROC: {aucroc_val:.4f}) EDL Model"
+            )
+            checkpoint = {
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+                "predictions": predictions,
+                "epoch": epoch,
+                "stage": stage_name,
+                "stage_epoch": epoch + 1,
+                "auroc": aucroc_val,
+                "best_aucroc": aucroc_val,
+                "best_metric_name": best_metric_name,
+                "best_metric_value": best_aucroc,
+                "prediction_aggregation": _prediction_aggregation_config(args),
+                "epochs_no_improve": epochs_no_improve,
+                "history": history,
+                "training_schedule": _training_schedule(args),
+                "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
+                "train_mode": getattr(args, "train_mode", "full"),
+                "freeze_backbone": getattr(args, "freeze_backbone", "n"),
+            }
+            torch.save(checkpoint, _fold_best_model_path(args))
+            torch.save(checkpoint, stage_best_path)
+        else:
+            stage_no_improve += 1
+            epochs_no_improve = stage_no_improve
+
+        _save_last_checkpoint(
+            args,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            best_aucroc,
+            epochs_no_improve,
+            history,
+            stage_name=stage_name,
+            stage_epoch=epoch + 1,
+        )
+
+        if stage_patience > 0 and stage_no_improve >= stage_patience:
+            print(
+                f"Stage early stopping at epoch {epoch + 1} [{stage_name}]: "
+                f"no improvement for {stage_patience} epochs, best {best_metric_name}: {stage_best_metric:.4f}"
+            )
+            break
+
+        print(f"[Fold{args.cur_fold}], Best {_best_metric_name(args)}: {best_aucroc:.4f}")
+
+    return best_aucroc, epochs_no_improve
+
+
+def _edl_staged_train_loop(args, device):
+    print(f"\n================== EDL fold: {args.cur_fold} staged training ======================")
+    if getattr(args, "resume", False):
+        print("[WARN] --resume is ignored for staged EDL; staged runs restart from the BCE warm-start checkpoint.")
+
+    ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
+    if ckpt["config"]["model"]["image_encoder"]["model_type"] == "swin":
+        args.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["model_type"]
+    elif ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
+        args.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["name"]
+
+    train_loader, valid_loader = edl_get_dataloader(args)
+    print(f"train_loader: {len(train_loader)}, valid_loader: {len(valid_loader)}")
+
+    model = _create_edl_model(args, ckpt, device)
+    bce_checkpoint_path = _load_bce_warmstart_for_fold(args, model)
+    if getattr(args, "staged_freeze_encoder", True):
+        model.set_encoder_trainable(False)
+        print("Stage setup: BCE encoder frozen; training EDL head only.")
+    else:
+        model.set_encoder_trainable(True)
+        print("Stage setup: BCE encoder remains trainable.")
+    model.set_edl_head_trainable(True)
+    print(model)
+
+    logger = SummaryWriter(args.tb_logs_path / f"edl_fold{args.cur_fold}")
+    class_weights = _compute_fold_class_weights(args)
+    class_weight_mode = _class_weight_mode(args)
+    if class_weight_mode != "none" and class_weights is None:
+        raise ValueError(
+            f"class_weight_mode={class_weight_mode} but class_weights could not be computed for fold {args.cur_fold}. "
+            "Check train_folds labels before training."
+        )
+    _write_edl_run_config(
+        args,
+        split_summary=getattr(args, "_edl_split_summary", None),
+        fold_diagnostic={
+            "fold": int(args.cur_fold),
+            "eval_split": getattr(args, "eval_split", "val"),
+            "training_schedule": "staged",
+            "bce_warmstart_path": str(bce_checkpoint_path),
+            "bce_stage_patience": getattr(args, "bce_stage_patience", None),
+            "edl_stage_patience": getattr(args, "edl_stage_patience", None),
+            "staged_freeze_encoder": bool(getattr(args, "staged_freeze_encoder", True)),
+            "train_counts": _class_count_summary(args.train_folds, args.label),
+            "eval_counts": _class_count_summary(args.valid_folds, args.label),
+            "weighted_BCE_enabled": _weighted_bce_enabled(args),
+            "class_weight_mode": class_weight_mode,
+            "class_weight_info": getattr(args, "_edl_class_weight_info", None),
+            "class_weights": class_weights,
+            "balanced_sampler": _balanced_sampler_mode(args),
+            "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
+            "edl_focal_gamma": getattr(args, "edl_focal_gamma", 0.0),
+            "prediction_aggregation": _prediction_aggregation_config(args),
+            "best_metric_name": _best_metric_name(args),
+            "best_checkpoint_path": str(_fold_best_model_path(args)),
+            "last_checkpoint_path": str(_fold_last_checkpoint_path(args)),
+            "metrics_csv": str(_metrics_csv_path(args)),
+        },
+    )
+
+    optimizer, scheduler, scaler = _build_stage_optimizer_scheduler(args, model, train_loader, args.epochs, args.lr, device)
+    criterion = _build_edl_criterion(args, class_weights)
+    history = {"epochs": [], "train_loss": [], "valid_loss": [], "valid_aucroc": []}
+    eval_name = getattr(args, "eval_split", "val")
+    best_aucroc, epochs_no_improve = _run_edl_stage(
+        args,
+        model,
+        train_loader,
+        valid_loader,
+        criterion,
+        optimizer,
+        scheduler,
+        scaler,
+        logger,
+        device,
+        history,
+        eval_name,
+        stage_name="edl_head",
+        stage_epochs=args.epochs,
+        best_aucroc=0.0,
+        epochs_no_improve=0,
+    )
+
+    best_model_path = _fold_best_model_path(args)
+    if best_model_path.exists():
+        predictions = torch.load(best_model_path, map_location="cpu", weights_only=False)["predictions"]
+        args.valid_folds = _attach_prediction_scores(
+            args,
+            args.valid_folds,
+            predictions,
+            image_score_col="image_prediction_prob",
+        )
+    else:
+        print(f"Warning: No best model checkpoint found at {best_model_path}")
+
+    metrics_df = _save_fold_metrics_csv(args, history, eval_name)
+    _save_fold_loss_curve(args, history)
+    logger.close()
+    _empty_cuda_cache(device)
+    gc.collect()
+    return args.valid_folds.copy(), metrics_df
+
+
 def edl_train_loop(args, device):
     """
     Single-fold EDL training loop.
     """
+    if _training_schedule(args) == "staged":
+        return _edl_staged_train_loop(args, device)
+
     print(f'\n================== EDL fold: {args.cur_fold} training ======================')
 
     ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
@@ -1133,6 +1686,8 @@ def edl_train_loop(args, device):
                 logger.add_scalar(f"valid/{loss_key}", valid_stats[loss_key], epoch + 1)
 
         history_values = {
+            "stage": "joint",
+            "stage_epoch": epoch + 1,
             "train_loss": avg_loss,
             "valid_loss": avg_val_loss,
             "valid_aucroc": aucroc_val,
@@ -1196,6 +1751,8 @@ def edl_train_loop(args, device):
                     'prediction_aggregation': _prediction_aggregation_config(args),
                     'epochs_no_improve': epochs_no_improve,
                     'history': history,
+                    'training_schedule': _training_schedule(args),
+                    'bce_warmstart_path': getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
                     'train_mode': getattr(args, "train_mode", "full"),
                     'freeze_backbone': getattr(args, "freeze_backbone", "n"),
                 }, _fold_best_model_path(args)

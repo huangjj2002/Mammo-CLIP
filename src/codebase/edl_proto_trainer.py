@@ -6,6 +6,9 @@ adding per-class prototype explanations.
 """
 
 import gc
+import json
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -44,6 +47,7 @@ from edl_trainer import (
     _evidence_store,
     _evidence_summary,
     _is_edl_annealing_complete,
+    _json_safe,
     _load_best_metric_value_from_checkpoint,
     _compute_fold_class_weights,
     _empty_cuda_cache,
@@ -66,6 +70,7 @@ from edl_trainer import (
 from metrics import auroc
 from utils import (
     AverageMeter,
+    append_run_id,
     audit_laterality_label_mixes,
     seed_all,
     timeSince,
@@ -117,8 +122,56 @@ def _fold_last_checkpoint_path(args):
     return args.chk_pt_path / model_name
 
 
+def _fold_stage_best_checkpoint_path(args, stage_name):
+    safe_stage = str(stage_name).replace(" ", "_")
+    model_name = f"{args.model_base_name}_prototype_edl_seed_{args.seed}_fold{args.cur_fold}_{safe_stage}_stage_best.pth"
+    return args.chk_pt_path / model_name
+
+
 def _metrics_csv_path(args):
     return args.output_path / f"prototype_edl_fold{args.cur_fold}_metrics.csv"
+
+
+def _training_schedule(args):
+    return str(getattr(args, "proto_training_schedule", "joint") or "joint").strip().lower()
+
+
+def _stage_manifest_path(args):
+    return args.output_path / "prototype_edl_stage_manifest.json"
+
+
+def _write_stage_manifest(args, updates=None, fold_updates=None):
+    path = _stage_manifest_path(args)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        try:
+            manifest = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            manifest = {}
+    else:
+        manifest = {}
+
+    if updates:
+        manifest.update(_json_safe(updates))
+    if fold_updates is not None:
+        fold_key = str(getattr(args, "cur_fold", "unknown"))
+        manifest.setdefault("folds", {})
+        current = manifest["folds"].get(fold_key, {})
+        current.update(_json_safe(fold_updates))
+        manifest["folds"][fold_key] = current
+
+    path.write_text(json.dumps(_json_safe(manifest), indent=2), encoding="utf-8")
+    return path
+
+
+def _stage_patience(args, stage_name, default=None):
+    if stage_name == "prototype_warmup":
+        return int(getattr(args, "proto_warmup_patience", default if default is not None else 0))
+    if stage_name == "edl_calibration":
+        return int(getattr(args, "edl_stage_patience", getattr(args, "patience", default if default is not None else 0)))
+    if stage_name == "joint":
+        return int(getattr(args, "patience", default if default is not None else 0))
+    return int(default if default is not None else 0)
 
 
 def _empty_history():
@@ -138,18 +191,35 @@ def _ensure_proto_history_keys(history):
     return history
 
 
-def _save_last_checkpoint(args, model, optimizer, scheduler, scaler, epoch, best_aucroc, epochs_no_improve, history):
+def _save_last_checkpoint(
+    args,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch,
+    best_aucroc,
+    epochs_no_improve,
+    history,
+    stage_name="joint",
+    stage_epoch=None,
+):
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
         "scaler": scaler.state_dict() if scaler.is_enabled() else None,
         "epoch": epoch,
+        "stage": stage_name,
+        "stage_epoch": stage_epoch,
         "best_aucroc": best_aucroc,
         "best_metric_name": _best_metric_name(args),
         "best_metric_value": best_aucroc,
         "epochs_no_improve": epochs_no_improve,
         "history": history,
+        "training_schedule": _training_schedule(args),
+        "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
+        "prototype_initialized_from": getattr(args, "_prototype_initialized_from", None),
         "train_mode": getattr(args, "train_mode", "full"),
         "freeze_backbone": getattr(args, "freeze_backbone", "n"),
         "edl_proto_k": getattr(args, "edl_proto_k", None),
@@ -222,6 +292,194 @@ def _save_fold_metrics_csv(args, history, eval_split):
     return metrics_df
 
 
+def _auto_bce_run_id(args):
+    return f"{getattr(args, 'run_id', 'prototype_edl')}_bce_warmstart"
+
+
+def _auto_bce_root(args):
+    base_root = (
+        f"lr_{args.bce_stage_lr}_epochs_{args.bce_stage_epochs}_weighted_BCE_{args.weighted_BCE}_"
+        f"{args.label}_data_frac_{getattr(args, 'data_frac', 1.0)}"
+    )
+    root, _ = append_run_id(base_root, _auto_bce_run_id(args))
+    return root
+
+
+def _auto_bce_checkpoint_dir(args):
+    return Path(args.checkpoints) / args.dataset / "classifier" / args.arch / _auto_bce_root(args)
+
+
+def _bce_checkpoint_candidates(path, fold):
+    if not path.exists():
+        return []
+    patterns = [f"*fold{fold}_best_aucroc*.pth", f"*fold{fold}_best_acc*.pth"]
+    candidates = []
+    for pattern in patterns:
+        candidates.extend(path.glob(pattern))
+    if not candidates:
+        for pattern in patterns:
+            candidates.extend(path.rglob(pattern))
+    unique = {str(candidate.resolve()): candidate for candidate in candidates}
+    return sorted(unique.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _resolve_bce_warmstart_path(args, fold):
+    path_value = getattr(args, "bce_warmstart_path", None)
+    if not path_value:
+        raise ValueError("staged mode needs a BCE warm-start path after Stage 1 setup.")
+
+    path_text = str(path_value)
+    if "{fold}" in path_text:
+        path_text = path_text.format(fold=fold)
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = Path(getattr(args, "project_root", Path.cwd())) / path
+
+    if path.is_file():
+        resolved = path
+    elif path.is_dir():
+        candidates = _bce_checkpoint_candidates(path, fold)
+        if not candidates:
+            raise FileNotFoundError(f"No BCE checkpoint matching fold{fold} found in {path}.")
+        if len(candidates) > 1:
+            print(f"[WARN] Multiple BCE checkpoints found for fold{fold}; using newest: {candidates[0]}")
+        resolved = candidates[0]
+    else:
+        raise FileNotFoundError(f"BCE warm-start path does not exist: {path}")
+
+    args._resolved_bce_warmstart_path = str(resolved)
+    return resolved
+
+
+def _run_bce_warmstart_training(args):
+    codebase_dir = Path(getattr(args, "codebase_dir", Path(__file__).parent))
+    train_script = codebase_dir / "train_classifier.py"
+    cmd = [
+        sys.executable,
+        str(train_script),
+        "--tensorboard-path",
+        str(args.tensorboard_path),
+        "--checkpoints",
+        str(args.checkpoints),
+        "--output_path",
+        str(args.output_path),
+        "--data-dir",
+        str(args.data_dir),
+        "--img-dir",
+        str(args.img_dir),
+        "--clip_chk_pt_path",
+        str(args.clip_chk_pt_path),
+        "--csv-file",
+        str(args.csv_file),
+        "--dataset",
+        str(args.dataset),
+        "--data_frac",
+        str(getattr(args, "data_frac", 1.0)),
+        "--arch",
+        str(args.arch),
+        "--label",
+        str(args.label),
+        "--VER",
+        "bce_warmstart",
+        "--n_folds",
+        str(args.n_folds),
+        "--seed",
+        str(args.seed),
+        "--batch-size",
+        str(args.batch_size),
+        "--num-workers",
+        str(args.num_workers),
+        "--epochs",
+        str(args.bce_stage_epochs),
+        "--lr",
+        str(args.bce_stage_lr),
+        "--weight-decay",
+        str(args.weight_decay),
+        "--warmup-epochs",
+        str(args.warmup_epochs),
+        "--img-size",
+        *[str(size) for size in args.img_size],
+        "--device",
+        str(args.device),
+        "--apex",
+        "y" if getattr(args, "apex", False) else "n",
+        "--print-freq",
+        str(args.print_freq),
+        "--log-freq",
+        str(args.log_freq),
+        "--model-type",
+        "classifier",
+        "--weighted-BCE",
+        str(args.weighted_BCE),
+        "--patience",
+        str(args.bce_stage_patience),
+        "--balanced-dataloader",
+        str(getattr(args, "balanced_dataloader", "n")),
+        "--run-id",
+        _auto_bce_run_id(args),
+    ]
+    print("\n================ Stage 1: BCE warm-start training ================")
+    print("Running:", " ".join(cmd))
+    result = subprocess.run(cmd, cwd=str(codebase_dir))
+    if result.returncode != 0:
+        raise RuntimeError(f"BCE warm-start training failed with exit code {result.returncode}.")
+    checkpoint_dir = _auto_bce_checkpoint_dir(args)
+    print(f"BCE warm-start checkpoint directory: {checkpoint_dir}")
+    return checkpoint_dir
+
+
+def _ensure_bce_warmstart(args):
+    if _training_schedule(args) != "staged":
+        return None
+
+    manifest_updates = {
+        "training_schedule": "staged",
+        "checkpoint_selection_metric": _best_metric_name(args),
+        "prediction_aggregation": _prediction_aggregation_config(args),
+        "bce_stage": {
+            "provided_warmstart_path": getattr(args, "bce_warmstart_path", None),
+            "epochs": getattr(args, "bce_stage_epochs", None),
+            "lr": getattr(args, "bce_stage_lr", None),
+            "patience": getattr(args, "bce_stage_patience", None),
+            "weighted_BCE": getattr(args, "weighted_BCE", None),
+        },
+        "prototype_warmup_stage": {
+            "epochs": getattr(args, "proto_warmup_epochs", None),
+            "patience": getattr(args, "proto_warmup_patience", None),
+            "kl_weight": 0.0,
+            "freeze_encoder": bool(getattr(args, "staged_freeze_encoder", True)),
+        },
+        "edl_calibration_stage": {
+            "epochs": getattr(args, "epochs", None),
+            "patience": getattr(args, "edl_stage_patience", getattr(args, "patience", None)),
+            "kl_weight": getattr(args, "edl_kl_weight", None),
+            "freeze_encoder": bool(getattr(args, "staged_freeze_encoder", True)),
+            "freeze_prototypes": bool(getattr(args, "edl_stage_freeze_prototypes", True)),
+        },
+    }
+
+    if getattr(args, "bce_warmstart_path", None):
+        manifest_updates["bce_stage"]["source"] = "provided"
+        _write_stage_manifest(args, manifest_updates)
+        return Path(str(args.bce_warmstart_path))
+
+    checkpoint_dir = _auto_bce_checkpoint_dir(args)
+    missing_folds = []
+    for fold in _fold_indices(args):
+        if not _bce_checkpoint_candidates(checkpoint_dir, fold):
+            missing_folds.append(fold)
+    if missing_folds:
+        checkpoint_dir = _run_bce_warmstart_training(args)
+    else:
+        print(f"Reusing existing automatic BCE warm-start directory: {checkpoint_dir}")
+
+    args.bce_warmstart_path = str(checkpoint_dir)
+    manifest_updates["bce_stage"]["source"] = "auto_trained"
+    manifest_updates["bce_stage"]["auto_checkpoint_dir"] = str(checkpoint_dir)
+    _write_stage_manifest(args, manifest_updates)
+    return checkpoint_dir
+
+
 def _save_fold_loss_curve(args, history):
     if not history["epochs"]:
         return
@@ -246,9 +504,15 @@ def _record_fold_summary(args, metrics_df, summaries):
     if metrics_df.empty:
         return
 
-    metric_col = _best_metric_column(args, metrics_df)
-    best_idx = metrics_df[metric_col].idxmax()
-    best_row = metrics_df.loc[best_idx]
+    summary_metrics = metrics_df
+    if _training_schedule(args) == "staged" and "stage" in metrics_df.columns:
+        non_warmup_metrics = metrics_df[metrics_df["stage"] != "prototype_warmup"]
+        if not non_warmup_metrics.empty:
+            summary_metrics = non_warmup_metrics
+
+    metric_col = _best_metric_column(args, summary_metrics)
+    best_idx = summary_metrics[metric_col].idxmax()
+    best_row = summary_metrics.loc[best_idx]
     summaries.append(
         {
             "fold": args.cur_fold,
@@ -368,9 +632,12 @@ def prototype_edl_train_fn(train_loader, model, criterion, optimizer, epoch, arg
     start = time.time()
     skipped_batches = 0
 
+    stage_name = getattr(args, "_current_stage", "joint")
+    stage_epoch = int(getattr(args, "_current_stage_epoch", epoch + 1))
+    stage_total_epochs = int(getattr(args, "_stage_total_epochs", args.epochs))
     progress_iter = tqdm(
         enumerate(train_loader),
-        desc=f"[{epoch + 1:03d}/{args.epochs:03d} epoch prototype train]",
+        desc=f"[{stage_name} {stage_epoch:03d}/{stage_total_epochs:03d} prototype train]",
         total=len(train_loader),
     )
     for step, data in progress_iter:
@@ -568,11 +835,16 @@ def _fit_classwise_kmeans(features, labels, prototypes_per_class, seed):
 def _initialize_prototypes_from_train(args, model, device):
     if getattr(args, "edl_proto_init", "kmeans").lower() != "kmeans":
         print("Prototype initialization skipped; using random learnable prototypes.")
+        args._prototype_initialized_from = "random"
         return
 
     features, labels = _collect_train_embeddings(args, model, device)
     prototypes = _fit_classwise_kmeans(features, labels, args.edl_proto_k, args.seed)
     model.initialize_prototypes(prototypes.to(device))
+    if _training_schedule(args) == "staged" and getattr(args, "_resolved_bce_warmstart_path", None):
+        args._prototype_initialized_from = "bce_encoder_kmeans"
+    else:
+        args._prototype_initialized_from = "current_encoder_kmeans"
     print(f"Initialized prototype tensor with shape: {tuple(prototypes.shape)}")
 
 
@@ -585,6 +857,329 @@ def _create_model(args, ckpt):
         temperature=args.edl_proto_temperature,
         normalize=args.edl_proto_normalize,
     )
+
+
+def _load_bce_warmstart_for_fold(args, model):
+    bce_checkpoint_path = _resolve_bce_warmstart_path(args, args.cur_fold)
+    checkpoint = torch.load(bce_checkpoint_path, map_location="cpu", weights_only=False)
+    loaded_count = model.load_bce_encoder_state(checkpoint, strict=True)
+    print(f"Loaded {loaded_count} image_encoder tensors from BCE warm-start: {bce_checkpoint_path}")
+    _write_stage_manifest(
+        args,
+        fold_updates={
+            "bce_warmstart_path": str(bce_checkpoint_path),
+            "bce_encoder_tensors_loaded": loaded_count,
+        },
+    )
+    return bce_checkpoint_path
+
+
+def _set_stage_trainability(args, model, stage_name):
+    if stage_name == "joint":
+        return
+
+    freeze_encoder = bool(getattr(args, "staged_freeze_encoder", True))
+    model.set_encoder_trainable(not freeze_encoder)
+    if stage_name == "prototype_warmup":
+        model.set_prototypes_trainable(True)
+        model.set_evidence_weights_trainable(True)
+    elif stage_name == "edl_calibration":
+        model.set_prototypes_trainable(not bool(getattr(args, "edl_stage_freeze_prototypes", True)))
+        model.set_evidence_weights_trainable(True)
+    else:
+        raise ValueError(f"Unknown Prototype EDL training stage: {stage_name}")
+
+
+def _build_stage_optimizer_scheduler(args, model, train_loader, stage_epochs, lr, device):
+    trainable_params = [param for param in model.parameters() if param.requires_grad]
+    total_params = sum(param.numel() for param in model.parameters())
+    trainable_param_count = sum(param.numel() for param in trainable_params)
+    print(f"Trainable parameters: {trainable_param_count:,} / {total_params:,}")
+    if not trainable_params:
+        raise ValueError("No trainable parameters found for this Prototype EDL stage.")
+
+    optimizer = AdamW(trainable_params, lr=lr, weight_decay=args.weight_decay)
+    if args.warmup_epochs == 1:
+        warmup_steps = len(train_loader)
+    elif args.warmup_epochs == 0.1:
+        warmup_steps = stage_epochs
+    else:
+        warmup_steps = 10
+    lr_config = {
+        "total_epochs": stage_epochs,
+        "warmup_steps": warmup_steps,
+        "total_steps": len(train_loader) * stage_epochs,
+    }
+    scheduler = LinearWarmupCosineAnnealingLR(optimizer, **lr_config)
+    scaler = torch.cuda.amp.GradScaler(enabled=_amp_enabled(args, device))
+    return optimizer, scheduler, scaler
+
+
+def _build_edl_criterion(args, class_weights, kl_weight):
+    return EDLLoss(
+        num_classes=args.num_classes,
+        loss_type=args.edl_loss_type,
+        kl_weight=kl_weight,
+        annealing_start=args.edl_annealing_start,
+        annealing_epochs=args.edl_annealing_epochs,
+        class_weights=class_weights,
+        focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
+    )
+
+
+def _run_training_stage(
+    args,
+    model,
+    train_loader,
+    valid_loader,
+    criterion,
+    optimizer,
+    scheduler,
+    scaler,
+    logger,
+    device,
+    history,
+    eval_name,
+    stage_name,
+    stage_epochs,
+    global_epoch_offset,
+    best_aucroc,
+    epochs_no_improve,
+    save_best,
+    stage_patience=None,
+    restore_stage_best=False,
+):
+    last_predictions = None
+    if stage_epochs <= 0:
+        return best_aucroc, epochs_no_improve, last_predictions
+
+    args._current_stage = stage_name
+    args._stage_total_epochs = stage_epochs
+    best_metric_name = _best_metric_name(args)
+    stage_patience = _stage_patience(args, stage_name, default=stage_patience)
+    stage_best_metric = float("-inf")
+    stage_no_improve = 0
+    stage_best_path = _fold_stage_best_checkpoint_path(args, stage_name)
+    print(
+        f"\n================ Stage: {stage_name} ({stage_epochs} epoch(s), "
+        f"patience={stage_patience}) ================"
+    )
+
+    for stage_epoch in range(stage_epochs):
+        global_epoch = global_epoch_offset + stage_epoch
+        args._current_stage_epoch = stage_epoch + 1
+        start_time = time.time()
+        criterion_epoch = global_epoch if stage_name == "joint" else stage_epoch
+        criterion.current_epoch = criterion_epoch
+        annealing_complete = True if stage_name == "prototype_warmup" else _is_edl_annealing_complete(args, criterion_epoch)
+        if save_best and not annealing_complete:
+            print(
+                f"Epoch {global_epoch + 1} ({stage_name} {stage_epoch + 1}) - EDL annealing is active; "
+                f"stage early stopping still uses patience={stage_patience}."
+            )
+
+        avg_loss, train_loss_stats = prototype_edl_train_fn(
+            train_loader, model, criterion, optimizer, global_epoch, args, scheduler, scaler, logger, device
+        )
+        valid_stats, predictions = edl_valid_fn(
+            valid_loader, model, criterion, args, device, global_epoch, logger=logger
+        )
+        last_predictions = predictions
+        avg_val_loss = valid_stats["loss"]
+        args.valid_folds = _attach_prediction_scores(
+            args,
+            args.valid_folds,
+            predictions,
+            image_score_col="image_prediction_prob",
+        )
+
+        valid_agg = _aggregate_prediction_scores(args, args.valid_folds, args.label, "prediction_prob")
+        aucroc_val = auroc(valid_agg[args.label].values.astype(int), valid_agg["prediction_prob"].values)
+        threshold = _prediction_threshold(args)
+        patient_diag = _threshold_diagnostics(valid_agg, args.label, "prediction_prob", "eval_patient", threshold)
+        image_diag = _threshold_diagnostics(args.valid_folds, args.label, "image_prediction_prob", "eval_image", threshold)
+        elapsed = time.time() - start_time
+
+        print(
+            f"Epoch {global_epoch + 1} [{stage_name} {stage_epoch + 1}/{stage_epochs}] - "
+            f"avg_train_loss: {avg_loss:.4f}  avg_{eval_name}_loss: {avg_val_loss:.4f}  "
+            f"proto_loss: {train_loss_stats['prototype_loss']:.4f}  "
+            f"proto_raw: {train_loss_stats['prototype_loss_raw']:.4f}  AUC-ROC: {aucroc_val:.4f}  "
+            f"BACC@0.5: {patient_diag['eval_patient_bacc_at_0_5']:.4f}  "
+            f"Pred_Pos@0.5: {patient_diag['eval_patient_pred_pos_at_0_5']}  time: {elapsed:.0f}s"
+        )
+        logger.add_scalar(f"{eval_name}/{args.label}/AUC-ROC", aucroc_val, global_epoch + 1)
+        logger.add_scalar(f"{eval_name}/{args.label}/BACC@0.5", patient_diag["eval_patient_bacc_at_0_5"], global_epoch + 1)
+        logger.add_scalar(f"{eval_name}/{args.label}/Pred_Pos@0.5", patient_diag["eval_patient_pred_pos_at_0_5"], global_epoch + 1)
+        logger.add_scalar("train/epoch_loss", avg_loss, global_epoch + 1)
+        logger.add_scalar("train/epoch_edl_loss", train_loss_stats["edl_loss"], global_epoch + 1)
+        logger.add_scalar("train/epoch_proto_loss", train_loss_stats["prototype_loss"], global_epoch + 1)
+        logger.add_scalar("train/epoch_proto_loss_raw", train_loss_stats["prototype_loss_raw"], global_epoch + 1)
+        logger.add_scalar("train/edl_proto_loss_weight", args.edl_proto_loss_weight, global_epoch + 1)
+        logger.add_scalar("train/epoch_proto_attract_loss", train_loss_stats["attract_loss"], global_epoch + 1)
+        logger.add_scalar("train/epoch_proto_separation_loss", train_loss_stats["separation_loss"], global_epoch + 1)
+        logger.add_scalar("train/epoch_proto_diversity_loss", train_loss_stats["diversity_loss"], global_epoch + 1)
+        logger.add_scalar("valid/epoch_loss", avg_val_loss, global_epoch + 1)
+
+        history_values = {
+            "stage": stage_name,
+            "stage_epoch": stage_epoch + 1,
+            "train_loss": avg_loss,
+            "train_edl_loss": train_loss_stats["edl_loss"],
+            "train_proto_loss": train_loss_stats["prototype_loss"],
+            "train_proto_loss_raw": train_loss_stats["prototype_loss_raw"],
+            "train_proto_attract_loss": train_loss_stats["attract_loss"],
+            "train_proto_separation_loss": train_loss_stats["separation_loss"],
+            "train_proto_diversity_loss": train_loss_stats["diversity_loss"],
+            "valid_loss": avg_val_loss,
+            "valid_aucroc": aucroc_val,
+            "eval_data_loss": valid_stats["data_loss"],
+            "eval_unweighted_data_loss": valid_stats["unweighted_data_loss"],
+            "eval_class_weighted_data_loss": valid_stats["class_weighted_data_loss"],
+            "eval_focal_data_loss": valid_stats["focal_data_loss"],
+            "eval_kl_loss": valid_stats["kl_loss"],
+            "eval_total_loss": valid_stats["total_loss"],
+            "eval_annealing_coef": valid_stats["annealing_coef"],
+            "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
+            "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
+            "eval_focal_weighted_denominator": valid_stats["focal_weighted_denominator"],
+            "eval_skipped_batches": valid_stats["skipped_batches"],
+            "prediction_threshold": threshold,
+            "prediction_score_agg": _prediction_score_agg(args),
+            "prediction_group_cols": ",".join(_prediction_group_cols(args)),
+            "best_metric_name": best_metric_name,
+        }
+        history_values.update(patient_diag)
+        history_values.update(image_diag)
+        history_values.update({f"eval_{key}": value for key, value in valid_stats.items() if key.startswith("label")})
+        for key, value in train_loss_stats.items():
+            if key.startswith("edl_"):
+                history_values[f"train_{key}"] = value
+            elif key.startswith("train_"):
+                history_values[key] = value
+            elif key.startswith("label"):
+                history_values[f"train_{key}"] = value
+        history_values.update({key: value for key, value in valid_stats.items() if key.startswith("eval_")})
+        best_metric_value = _current_best_metric_value(args, history_values, aucroc_val)
+        history_values["selected_best_metric_value"] = best_metric_value
+        _append_epoch_history(history, global_epoch + 1, history_values)
+
+        stage_improved = np.isfinite(best_metric_value) and (
+            not np.isfinite(stage_best_metric) or stage_best_metric < best_metric_value
+        )
+        if stage_improved:
+            stage_best_metric = best_metric_value
+            stage_no_improve = 0
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "predictions": predictions,
+                    "epoch": global_epoch,
+                    "stage": stage_name,
+                    "stage_epoch": stage_epoch + 1,
+                    "auroc": aucroc_val,
+                    "best_metric_name": best_metric_name,
+                    "best_metric_value": stage_best_metric,
+                    "prediction_aggregation": _prediction_aggregation_config(args),
+                    "training_schedule": _training_schedule(args),
+                    "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
+                    "prototype_initialized_from": getattr(args, "_prototype_initialized_from", None),
+                    "history": history,
+                },
+                stage_best_path,
+            )
+        else:
+            stage_no_improve += 1
+
+        has_best_checkpoint = bool(getattr(args, "_best_checkpoint_written", False))
+        if save_best and np.isfinite(best_metric_value) and (not has_best_checkpoint or best_aucroc < best_metric_value):
+            best_aucroc = best_metric_value
+            epochs_no_improve = 0
+            args._best_checkpoint_written = True
+            print(
+                f"Epoch {global_epoch + 1} - Save Best {best_metric_name}: {best_aucroc:.4f} "
+                f"(AUC-ROC: {aucroc_val:.4f}) Prototype EDL Model"
+            )
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict() if scaler.is_enabled() else None,
+                    "predictions": predictions,
+                    "epoch": global_epoch,
+                    "stage": stage_name,
+                    "stage_epoch": stage_epoch + 1,
+                    "auroc": aucroc_val,
+                    "best_aucroc": aucroc_val,
+                    "best_metric_name": best_metric_name,
+                    "best_metric_value": best_aucroc,
+                    "prediction_aggregation": _prediction_aggregation_config(args),
+                    "epochs_no_improve": epochs_no_improve,
+                    "history": history,
+                    "training_schedule": _training_schedule(args),
+                    "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
+                    "prototype_initialized_from": getattr(args, "_prototype_initialized_from", None),
+                    "train_mode": getattr(args, "train_mode", "full"),
+                    "freeze_backbone": getattr(args, "freeze_backbone", "n"),
+                    "edl_proto_k": args.edl_proto_k,
+                    "edl_proto_temperature": args.edl_proto_temperature,
+                    "edl_proto_normalize": args.edl_proto_normalize,
+                    "edl_proto_attract_weight": args.edl_proto_attract_weight,
+                    "edl_proto_separation_weight": args.edl_proto_separation_weight,
+                    "edl_proto_diversity_weight": args.edl_proto_diversity_weight,
+                    "edl_proto_loss_weight": args.edl_proto_loss_weight,
+                    "edl_proto_margin": args.edl_proto_margin,
+                    "edl_proto_balance_classes": args.edl_proto_balance_classes,
+                },
+                _fold_best_model_path(args),
+            )
+        elif save_best:
+            epochs_no_improve += 1
+
+        _save_last_checkpoint(
+            args,
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            global_epoch,
+            best_aucroc,
+            epochs_no_improve,
+            history,
+            stage_name=stage_name,
+            stage_epoch=stage_epoch + 1,
+        )
+
+        if stage_patience > 0 and stage_no_improve >= stage_patience:
+            print(
+                f"Stage early stopping at epoch {global_epoch + 1} [{stage_name}]: "
+                f"no improvement for {stage_patience} epochs, best {best_metric_name}: {stage_best_metric:.4f}"
+            )
+            break
+
+        if save_best:
+            print(f"[Fold{args.cur_fold}], Best {_best_metric_name(args)}: {best_aucroc:.4f}")
+
+    if restore_stage_best and stage_best_path.exists():
+        checkpoint = torch.load(stage_best_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(checkpoint["model"])
+        print(
+            f"Restored {stage_name} best model from {stage_best_path} "
+            f"({best_metric_name}={float(checkpoint.get('best_metric_value', float('nan'))):.4f})"
+        )
+
+    _write_stage_manifest(
+        args,
+        fold_updates={
+            f"{stage_name}_best_metric_name": best_metric_name,
+            f"{stage_name}_best_metric_value": stage_best_metric if np.isfinite(stage_best_metric) else None,
+            f"{stage_name}_stage_best_checkpoint": str(stage_best_path) if stage_best_path.exists() else None,
+            f"{stage_name}_patience": stage_patience,
+            f"{stage_name}_stopped_after_epoch": global_epoch + 1 if "global_epoch" in locals() else None,
+        },
+    )
+    return best_aucroc, epochs_no_improve, last_predictions
 
 
 def do_prototype_edl_experiments(args, device):
@@ -623,6 +1218,15 @@ def do_prototype_edl_experiments(args, device):
     oof_df = pd.DataFrame()
     fold_prediction_arrays = []
     fold_summaries = []
+    _write_stage_manifest(
+        args,
+        {
+            "training_schedule": _training_schedule(args),
+            "checkpoint_selection_metric": _best_metric_name(args),
+            "prediction_aggregation": _prediction_aggregation_config(args),
+        },
+    )
+    _ensure_bce_warmstart(args)
 
     for fold in _fold_indices(args):
         args.cur_fold = fold
@@ -703,7 +1307,154 @@ def do_prototype_edl_experiments(args, device):
     print("\n================ Prototype EDL Done! ================")
 
 
+def _prototype_edl_staged_train_loop(args, device):
+    print(f"\n================== Prototype EDL fold: {args.cur_fold} staged training ======================")
+    if getattr(args, "resume", False):
+        print("[WARN] --resume is ignored for staged Prototype EDL; staged runs restart from the BCE warm-start checkpoint.")
+    if not hasattr(args, "edl_proto_loss_weight"):
+        args.edl_proto_loss_weight = 1.0
+
+    ckpt = torch.load(args.clip_chk_pt_path, map_location="cpu", weights_only=False)
+    if ckpt["config"]["model"]["image_encoder"]["model_type"] == "swin":
+        args.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["model_type"]
+    elif ckpt["config"]["model"]["image_encoder"]["model_type"] == "cnn":
+        args.image_encoder_type = ckpt["config"]["model"]["image_encoder"]["name"]
+
+    train_loader, valid_loader = edl_get_dataloader(args)
+    print(f"train_loader: {len(train_loader)}, valid_loader: {len(valid_loader)}")
+
+    model = _create_model(args, ckpt).to(device)
+    bce_checkpoint_path = _load_bce_warmstart_for_fold(args, model)
+    if getattr(args, "staged_freeze_encoder", True):
+        model.set_encoder_trainable(False)
+        print("Stage setup: BCE encoder frozen.")
+    else:
+        model.set_encoder_trainable(True)
+        print("Stage setup: BCE encoder trainable.")
+
+    _initialize_prototypes_from_train(args, model, device)
+    print(model)
+    _write_stage_manifest(
+        args,
+        fold_updates={
+            "prototype_initialized_from": getattr(args, "_prototype_initialized_from", None),
+            "bce_warmstart_path": str(bce_checkpoint_path),
+            "staged_freeze_encoder": bool(getattr(args, "staged_freeze_encoder", True)),
+            "edl_stage_freeze_prototypes": bool(getattr(args, "edl_stage_freeze_prototypes", True)),
+            "bce_stage_patience": getattr(args, "bce_stage_patience", None),
+            "proto_warmup_patience": getattr(args, "proto_warmup_patience", None),
+            "edl_stage_patience": getattr(args, "edl_stage_patience", getattr(args, "patience", None)),
+        },
+    )
+
+    logger = SummaryWriter(args.tb_logs_path / f"prototype_edl_fold{args.cur_fold}")
+    class_weights = _compute_fold_class_weights(args)
+    class_weight_mode = _class_weight_mode(args)
+    if class_weight_mode != "none" and class_weights is None:
+        raise ValueError(
+            f"class_weight_mode={class_weight_mode} but class_weights could not be computed for fold {args.cur_fold}. "
+            "Check train_folds labels before training."
+        )
+
+    eval_name = getattr(args, "eval_split", "val")
+    history = _empty_history()
+    best_aucroc = 0.0
+    epochs_no_improve = 0
+    args._best_checkpoint_written = False
+    global_epoch_offset = 0
+
+    warmup_epochs = int(getattr(args, "proto_warmup_epochs", 0))
+    if warmup_epochs > 0:
+        _set_stage_trainability(args, model, "prototype_warmup")
+        warmup_optimizer, warmup_scheduler, warmup_scaler = _build_stage_optimizer_scheduler(
+            args, model, train_loader, warmup_epochs, args.lr, device
+        )
+        warmup_criterion = _build_edl_criterion(args, class_weights, kl_weight=0.0)
+        best_aucroc, epochs_no_improve, _ = _run_training_stage(
+            args,
+            model,
+            train_loader,
+            valid_loader,
+            warmup_criterion,
+            warmup_optimizer,
+            warmup_scheduler,
+            warmup_scaler,
+            logger,
+            device,
+            history,
+            eval_name,
+            stage_name="prototype_warmup",
+            stage_epochs=warmup_epochs,
+            global_epoch_offset=global_epoch_offset,
+            best_aucroc=best_aucroc,
+            epochs_no_improve=epochs_no_improve,
+            save_best=False,
+            stage_patience=args.proto_warmup_patience,
+            restore_stage_best=True,
+        )
+        global_epoch_offset += warmup_epochs
+
+    _set_stage_trainability(args, model, "edl_calibration")
+    edl_optimizer, edl_scheduler, edl_scaler = _build_stage_optimizer_scheduler(
+        args, model, train_loader, args.epochs, args.lr, device
+    )
+    edl_criterion = _build_edl_criterion(args, class_weights, kl_weight=args.edl_kl_weight)
+    best_aucroc, epochs_no_improve, _ = _run_training_stage(
+        args,
+        model,
+        train_loader,
+        valid_loader,
+        edl_criterion,
+        edl_optimizer,
+        edl_scheduler,
+        edl_scaler,
+        logger,
+        device,
+        history,
+        eval_name,
+        stage_name="edl_calibration",
+        stage_epochs=args.epochs,
+        global_epoch_offset=global_epoch_offset,
+        best_aucroc=best_aucroc,
+        epochs_no_improve=epochs_no_improve,
+        save_best=True,
+        stage_patience=args.edl_stage_patience,
+        restore_stage_best=False,
+    )
+
+    best_model_path = _fold_best_model_path(args)
+    if best_model_path.exists():
+        predictions = torch.load(best_model_path, map_location="cpu", weights_only=False)["predictions"]
+        args.valid_folds = _attach_prediction_scores(
+            args,
+            args.valid_folds,
+            predictions,
+            image_score_col="image_prediction_prob",
+        )
+    else:
+        print(f"Warning: No best model checkpoint found at {best_model_path}")
+
+    metrics_df = _save_fold_metrics_csv(args, history, eval_name)
+    _save_fold_loss_curve(args, history)
+    _write_stage_manifest(
+        args,
+        fold_updates={
+            "best_metric_name": _best_metric_name(args),
+            "best_metric_value": best_aucroc,
+            "metrics_csv": str(_metrics_csv_path(args)),
+            "best_checkpoint_path": str(best_model_path),
+        },
+    )
+    logger.close()
+    _empty_cuda_cache(device)
+    gc.collect()
+    return args.valid_folds.copy(), metrics_df
+
+
 def prototype_edl_train_loop(args, device):
+    if _training_schedule(args) == "staged":
+        return _prototype_edl_staged_train_loop(args, device)
+
     print(f"\n================== Prototype EDL fold: {args.cur_fold} training ======================")
     if not hasattr(args, "edl_proto_loss_weight"):
         args.edl_proto_loss_weight = 1.0
@@ -818,6 +1569,8 @@ def prototype_edl_train_loop(args, device):
         logger.add_scalar("valid/epoch_loss", avg_val_loss, epoch + 1)
 
         history_values = {
+            "stage": "joint",
+            "stage_epoch": epoch + 1,
             "train_loss": avg_loss,
             "train_edl_loss": train_loss_stats["edl_loss"],
             "train_proto_loss": train_loss_stats["prototype_loss"],
@@ -881,6 +1634,9 @@ def prototype_edl_train_loop(args, device):
                     "prediction_aggregation": _prediction_aggregation_config(args),
                     "epochs_no_improve": epochs_no_improve,
                     "history": history,
+                    "training_schedule": _training_schedule(args),
+                    "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
+                    "prototype_initialized_from": getattr(args, "_prototype_initialized_from", None),
                     "train_mode": getattr(args, "train_mode", "full"),
                     "freeze_backbone": getattr(args, "freeze_backbone", "n"),
                     "edl_proto_k": args.edl_proto_k,

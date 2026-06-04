@@ -182,6 +182,33 @@ class BreastClipPrototypeEDLClassifier(nn.Module):
     def initialize_prototypes(self, prototypes):
         self.prototype_head.initialize_prototypes(prototypes)
 
+    def load_bce_encoder_state(self, checkpoint, strict=True):
+        state_dict = checkpoint.get("model", checkpoint)
+        image_encoder_weights = {}
+        for key, value in state_dict.items():
+            if key.startswith("image_encoder."):
+                image_encoder_weights[".".join(key.split(".")[1:])] = value
+
+        if not image_encoder_weights:
+            raise ValueError("BCE checkpoint does not contain any image_encoder.* weights.")
+
+        self.image_encoder.load_state_dict(image_encoder_weights, strict=strict)
+        return len(image_encoder_weights)
+
+    def set_encoder_trainable(self, trainable):
+        trainable = bool(trainable)
+        self.freeze_image_encoder = not trainable
+        for param in self.image_encoder.parameters():
+            param.requires_grad = trainable
+        if not trainable:
+            self.image_encoder.eval()
+
+    def set_prototypes_trainable(self, trainable):
+        self.prototype_head.prototypes.requires_grad = bool(trainable)
+
+    def set_evidence_weights_trainable(self, trainable):
+        self.prototype_head.prototype_evidence_logits.requires_grad = bool(trainable)
+
     def forward(self, images, return_details=False):
         image_feature = self.extract_features(images)
         return self.prototype_head(image_feature, return_details=return_details)

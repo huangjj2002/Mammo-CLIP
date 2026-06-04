@@ -87,6 +87,16 @@ EDL_PROTO_DIVERSITY_WEIGHT = 0.01
 EDL_PROTO_LOSS_WEIGHT = 1.0
 EDL_PROTO_MARGIN = 1.0
 EDL_PROTO_BALANCE_CLASSES = "y"
+PROTO_TRAINING_SCHEDULE = "joint"
+BCE_WARMSTART_PATH = None
+BCE_STAGE_EPOCHS = 5
+BCE_STAGE_LR = 5e-5
+BCE_STAGE_PATIENCE = 2
+PROTO_WARMUP_EPOCHS = 2
+PROTO_WARMUP_PATIENCE = 2
+EDL_STAGE_PATIENCE = PATIENCE
+STAGED_FREEZE_ENCODER = "y"
+EDL_STAGE_FREEZE_PROTOTYPES = "y"
 
 import argparse
 import os
@@ -227,6 +237,77 @@ def build_parser():
     parser.add_argument("--tensorboard-dir", default=TENSORBOARD_DIR, help="Project-local tensorboard directory.")
     parser.add_argument("--run-id", default=None, help="Run identifier appended to output/checkpoint/log directories.")
     parser.add_argument("--resume", action="store_true", default=RESUME_TRAINING, help="Resume from last checkpoint.")
+    parser.add_argument(
+        "--edl-annealing-start",
+        type=float,
+        default=EDL_ANNEALING_START,
+        help="Epoch offset where the EDL KL annealing starts.",
+    )
+    parser.add_argument(
+        "--edl-annealing-epochs",
+        type=float,
+        default=EDL_ANNEALING_EPOCHS,
+        help="Number of epochs used to anneal the EDL KL coefficient to 1.0.",
+    )
+    parser.add_argument(
+        "--proto-training-schedule",
+        choices=["joint", "staged"],
+        default=PROTO_TRAINING_SCHEDULE,
+        help="joint keeps the legacy one-stage training; staged BCE-warm-starts prototype EDL.",
+    )
+    parser.add_argument(
+        "--bce-warmstart-path",
+        default=BCE_WARMSTART_PATH,
+        help="BCE checkpoint, checkpoint directory, or path template containing {fold}. If omitted in staged mode, BCE is trained first.",
+    )
+    parser.add_argument(
+        "--bce-stage-epochs",
+        type=int,
+        default=BCE_STAGE_EPOCHS,
+        help="Epochs for the automatic BCE warm-start stage when --bce-warmstart-path is omitted.",
+    )
+    parser.add_argument(
+        "--bce-stage-lr",
+        type=float,
+        default=BCE_STAGE_LR,
+        help="Learning rate for the automatic BCE warm-start stage.",
+    )
+    parser.add_argument(
+        "--bce-stage-patience",
+        type=int,
+        default=BCE_STAGE_PATIENCE,
+        help="Early stopping patience for the automatic BCE warm-start stage.",
+    )
+    parser.add_argument(
+        "--proto-warmup-epochs",
+        type=int,
+        default=PROTO_WARMUP_EPOCHS,
+        help="Staged mode prototype warmup epochs with EDL KL weight forced to 0.",
+    )
+    parser.add_argument(
+        "--proto-warmup-patience",
+        type=int,
+        default=PROTO_WARMUP_PATIENCE,
+        help="Early stopping patience for staged prototype warmup. 0 disables warmup early stopping.",
+    )
+    parser.add_argument(
+        "--edl-stage-patience",
+        type=int,
+        default=EDL_STAGE_PATIENCE,
+        help="Early stopping patience for the staged EDL calibration stage. 0 disables EDL-stage early stopping.",
+    )
+    parser.add_argument(
+        "--staged-freeze-encoder",
+        choices=["y", "n"],
+        default=STAGED_FREEZE_ENCODER,
+        help="Freeze the BCE warm-started image encoder during staged prototype/EDL training.",
+    )
+    parser.add_argument(
+        "--edl-stage-freeze-prototypes",
+        choices=["y", "n"],
+        default=EDL_STAGE_FREEZE_PROTOTYPES,
+        help="Freeze prototype vectors during the staged EDL calibration stage.",
+    )
     parser.add_argument("--edl-proto-k", "--edl_proto_k", dest="edl_proto_k", type=int, default=EDL_PROTO_K, help="Prototypes per class.")
     parser.add_argument(
         "--edl-proto-topk",
@@ -329,6 +410,10 @@ def main():
         raise ValueError("--effective-beta must be in [0, 1).")
     if cli_args.prediction_threshold < 0 or cli_args.prediction_threshold > 1:
         raise ValueError("--prediction-threshold must be in [0, 1].")
+    if cli_args.edl_annealing_start < 0:
+        raise ValueError("--edl-annealing-start must be non-negative.")
+    if cli_args.edl_annealing_epochs <= 0:
+        raise ValueError("--edl-annealing-epochs must be positive.")
     if cli_args.edl_proto_k <= 0:
         raise ValueError("--edl-proto-k must be positive.")
     if cli_args.edl_proto_topk <= 0:
@@ -343,6 +428,18 @@ def main():
             raise ValueError(f"--{loss_name.replace('_', '-')} must be non-negative.")
     if cli_args.edl_proto_margin <= 0:
         raise ValueError("--edl-proto-margin must be positive.")
+    if cli_args.bce_stage_epochs <= 0:
+        raise ValueError("--bce-stage-epochs must be positive.")
+    if cli_args.bce_stage_lr <= 0:
+        raise ValueError("--bce-stage-lr must be positive.")
+    if cli_args.bce_stage_patience < 0:
+        raise ValueError("--bce-stage-patience must be non-negative.")
+    if cli_args.proto_warmup_epochs < 0:
+        raise ValueError("--proto-warmup-epochs must be non-negative.")
+    if cli_args.proto_warmup_patience < 0:
+        raise ValueError("--proto-warmup-patience must be non-negative.")
+    if cli_args.edl_stage_patience < 0:
+        raise ValueError("--edl-stage-patience must be non-negative.")
     ensure_nltk_punkt()
 
     gpu_id = cli_args.gpu_id
@@ -424,6 +521,11 @@ def main():
     args.tensorboard_path = os.path.join(project_root, cli_args.tensorboard_dir)
     args.checkpoints = os.path.join(project_root, cli_args.model_save_dir)
     args.output_path = os.path.join(project_root, cli_args.csv_save_dir)
+    args.project_root = project_root
+    args.codebase_dir = codebase_dir
+    args.model_save_dir = cli_args.model_save_dir
+    args.csv_save_dir = cli_args.csv_save_dir
+    args.tensorboard_dir = cli_args.tensorboard_dir
 
     args.model_type = "prototype_edl_classifier"
     args.VER = "prototype_edl"
@@ -473,12 +575,22 @@ def main():
     args.freeze_backbone = "y" if args.train_mode == "head_only" else "n"
     args.resume = cli_args.resume
     args.skip_bad_batches = cli_args.skip_bad_batches
+    args.proto_training_schedule = cli_args.proto_training_schedule
+    args.bce_warmstart_path = cli_args.bce_warmstart_path
+    args.bce_stage_epochs = cli_args.bce_stage_epochs
+    args.bce_stage_lr = cli_args.bce_stage_lr
+    args.bce_stage_patience = cli_args.bce_stage_patience
+    args.proto_warmup_epochs = cli_args.proto_warmup_epochs
+    args.proto_warmup_patience = cli_args.proto_warmup_patience
+    args.edl_stage_patience = cli_args.edl_stage_patience
+    args.staged_freeze_encoder = cli_args.staged_freeze_encoder == "y"
+    args.edl_stage_freeze_prototypes = cli_args.edl_stage_freeze_prototypes == "y"
 
     args.num_classes = EDL_NUM_CLASSES
     args.edl_loss_type = EDL_LOSS_TYPE
     args.edl_kl_weight = EDL_KL_WEIGHT
-    args.edl_annealing_start = EDL_ANNEALING_START
-    args.edl_annealing_epochs = EDL_ANNEALING_EPOCHS
+    args.edl_annealing_start = cli_args.edl_annealing_start
+    args.edl_annealing_epochs = cli_args.edl_annealing_epochs
     args.edl_proto_k = cli_args.edl_proto_k
     args.edl_proto_topk = cli_args.edl_proto_topk
     args.edl_proto_temperature = cli_args.edl_proto_temperature
@@ -512,6 +624,14 @@ def main():
         balance_suffix_parts.append(f"thr_{args.prediction_threshold:g}")
     if args.edl_best_metric != EDL_BEST_METRIC:
         balance_suffix_parts.append(f"best_{args.edl_best_metric}")
+    if args.proto_training_schedule != PROTO_TRAINING_SCHEDULE:
+        freeze_suffix = "freezeenc" if args.staged_freeze_encoder else "trainenc"
+        proto_suffix = "freezeproto" if args.edl_stage_freeze_prototypes else "trainproto"
+        balance_suffix_parts.append(
+            f"schedule_{args.proto_training_schedule}_bce{args.bce_stage_epochs}p{args.bce_stage_patience}_"
+            f"warm{args.proto_warmup_epochs}p{args.proto_warmup_patience}_"
+            f"edlp{args.edl_stage_patience}_{freeze_suffix}_{proto_suffix}"
+        )
     balance_suffix = f"_{'_'.join(balance_suffix_parts)}" if balance_suffix_parts else ""
 
     base_root = (
@@ -569,6 +689,16 @@ def main():
     print(f"edl_best_metric: {args.edl_best_metric}")
     print(f"train_mode: {args.train_mode}")
     print(f"freeze_backbone: {args.freeze_backbone}")
+    print(f"proto_training_schedule: {args.proto_training_schedule}")
+    print(f"bce_warmstart_path: {args.bce_warmstart_path}")
+    print(f"bce_stage_epochs: {args.bce_stage_epochs}")
+    print(f"bce_stage_lr: {args.bce_stage_lr}")
+    print(f"bce_stage_patience: {args.bce_stage_patience}")
+    print(f"proto_warmup_epochs: {args.proto_warmup_epochs}")
+    print(f"proto_warmup_patience: {args.proto_warmup_patience}")
+    print(f"edl_stage_patience: {args.edl_stage_patience}")
+    print(f"staged_freeze_encoder: {args.staged_freeze_encoder}")
+    print(f"edl_stage_freeze_prototypes: {args.edl_stage_freeze_prototypes}")
     print(f"resume: {args.resume}")
     print(f"skip_bad_batches: {args.skip_bad_batches}")
     device = args.device if args.device != "cuda" else ("cuda" if torch.cuda.is_available() else "cpu")
