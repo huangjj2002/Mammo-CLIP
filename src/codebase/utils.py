@@ -61,8 +61,10 @@ def resolve_run_id(run_id=None):
     return run_id.strip("_") or time.strftime("%Y%m%d_%H%M%S")
 
 
-def append_run_id(root, run_id=None):
+def append_run_id(root, run_id=None, compact=False):
     resolved_run_id = resolve_run_id(run_id)
+    if compact and run_id is not None and str(run_id).strip() != "":
+        return f"run_{resolved_run_id}", resolved_run_id
     return f"{root}_run_{resolved_run_id}", resolved_run_id
 
 

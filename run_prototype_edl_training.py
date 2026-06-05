@@ -238,7 +238,11 @@ def build_parser():
     parser.add_argument("--model-save-dir", default=MODEL_SAVE_DIR, help="Project-local checkpoint directory.")
     parser.add_argument("--csv-save-dir", default=CSV_SAVE_DIR, help="Project-local prediction directory.")
     parser.add_argument("--tensorboard-dir", default=TENSORBOARD_DIR, help="Project-local tensorboard directory.")
-    parser.add_argument("--run-id", default=None, help="Run identifier appended to output/checkpoint/log directories.")
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Compact run identifier used for output/checkpoint/log directories.",
+    )
     parser.add_argument("--resume", action="store_true", default=RESUME_TRAINING, help="Resume from last checkpoint.")
     parser.add_argument(
         "--edl-annealing-start",
@@ -675,7 +679,7 @@ def main():
         f"m{args.edl_proto_margin}_bal_{'y' if args.edl_proto_balance_classes else 'n'}_mode_{args.train_mode}"
         f"{balance_suffix}"
     )
-    args.root, args.run_id = append_run_id(base_root, cli_args.run_id)
+    args.root, args.run_id = append_run_id(base_root, cli_args.run_id, compact=cli_args.run_id is not None)
     chk_pt_path = Path(args.checkpoints) / args.dataset / "prototype_edl_classifier" / args.arch / args.root
     output_path = Path(args.output_path) / args.dataset / "zz" / "prototype_edl_classifier" / args.arch / args.root
     tb_logs_path = Path(args.tensorboard_path) / args.dataset / "prototype_edl_classifier" / args.arch / args.root
