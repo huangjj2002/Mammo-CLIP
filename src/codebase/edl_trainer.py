@@ -226,6 +226,17 @@ def _prediction_aggregation_config(args):
     }
 
 
+def _wrong_evidence_penalty_config(args):
+    class_balanced = getattr(args, "edl_wrong_evidence_class_balanced", True)
+    if isinstance(class_balanced, str):
+        class_balanced = class_balanced.strip().lower() in {"y", "yes", "true", "1"}
+    return {
+        "weight": float(getattr(args, "edl_wrong_evidence_penalty_weight", 0.0) or 0.0),
+        "margin": float(getattr(args, "edl_wrong_evidence_margin", 0.05)),
+        "class_balanced": bool(class_balanced),
+    }
+
+
 def _attach_prediction_scores(args, df, image_scores, image_score_col="image_prediction_prob"):
     return attach_patient_mean_predictions(
         df,
@@ -362,6 +373,9 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
         "edl_kl_weight",
         "edl_annealing_start",
         "edl_annealing_epochs",
+        "edl_wrong_evidence_penalty_weight",
+        "edl_wrong_evidence_margin",
+        "edl_wrong_evidence_class_balanced",
         "edl_dropout",
         "edl_hidden_dim",
         "prediction_group_cols",
@@ -389,6 +403,7 @@ def _write_edl_run_config(args, split_summary=None, fold_diagnostic=None):
             "balanced_sampler_resolved": _balanced_sampler_mode(args),
             "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
             "prediction_aggregation": _prediction_aggregation_config(args),
+            "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
             "best_metric_name": _best_metric_name(args),
             "csv_file": str(getattr(args, "_resolved_csv_path", getattr(args, "csv_file", ""))),
             "data_dir": str(getattr(args, "data_dir", "")),
@@ -425,6 +440,9 @@ def _loss_component_meters():
         "class_weighted_data_loss": AverageMeter(),
         "focal_data_loss": AverageMeter(),
         "kl_loss": AverageMeter(),
+        "wrong_evidence_penalty": AverageMeter(),
+        "margin_violation_mean": AverageMeter(),
+        "total_evidence_mean": AverageMeter(),
         "total_loss": AverageMeter(),
         "annealing_coef": AverageMeter(),
         "focal_factor_mean": AverageMeter(),
@@ -440,6 +458,9 @@ def _update_loss_component_meters(meters, criterion, batch_size):
         "class_weighted_data_loss": "last_class_weighted_data_loss",
         "focal_data_loss": "last_focal_data_loss",
         "kl_loss": "last_kl_loss",
+        "wrong_evidence_penalty": "last_wrong_evidence_penalty",
+        "margin_violation_mean": "last_margin_violation_mean",
+        "total_evidence_mean": "last_total_evidence_mean",
         "total_loss": "last_total_loss",
         "annealing_coef": "last_annealing_coef",
         "focal_factor_mean": "last_focal_factor_mean",
@@ -456,6 +477,7 @@ def _update_loss_component_meters(meters, criterion, batch_size):
         "weighted_loss_mean": "last_class_weighted_loss_means",
         "focal_weighted_loss_mean": "last_class_focal_weighted_loss_means",
         "focal_factor_mean": "last_class_focal_factor_means",
+        "wrong_evidence_penalty_mean": "last_class_wrong_evidence_penalty_means",
     }
     if class_counts is None:
         return
@@ -479,6 +501,30 @@ def _loss_component_summary(losses, meters, skipped_batches=0):
     for key, meter in meters.items():
         stats[key] = float(meter.avg) if meter.count else float("nan")
     return stats
+
+
+def _log_epoch_loss_components(logger, prefix, stats, epoch):
+    for loss_key in (
+        "class_weighted_data_loss",
+        "focal_data_loss",
+        "focal_factor_mean",
+        "sample_weight_mean",
+        "wrong_evidence_penalty",
+        "margin_violation_mean",
+        "total_evidence_mean",
+    ):
+        if loss_key in stats and np.isfinite(float(stats[loss_key])):
+            logger.add_scalar(f"{prefix}/{loss_key}", stats[loss_key], epoch)
+
+
+def _add_wrong_evidence_history(history_values, prefix, stats):
+    for key in (
+        "wrong_evidence_penalty",
+        "margin_violation_mean",
+        "total_evidence_mean",
+    ):
+        if key in stats:
+            history_values[f"{prefix}_{key}"] = stats[key]
 
 
 def _safe_div(num, den):
@@ -723,6 +769,7 @@ def _save_last_checkpoint(
         "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
         "train_mode": getattr(args, "train_mode", "full"),
         "freeze_backbone": getattr(args, "freeze_backbone", "n"),
+        "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
     }
     torch.save(checkpoint, _fold_last_checkpoint_path(args))
 
@@ -1235,6 +1282,9 @@ def _build_edl_criterion(args, class_weights):
         annealing_epochs=args.edl_annealing_epochs,
         class_weights=class_weights,
         focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
+        wrong_evidence_penalty_weight=getattr(args, "edl_wrong_evidence_penalty_weight", 0.0),
+        wrong_evidence_margin=getattr(args, "edl_wrong_evidence_margin", 0.05),
+        wrong_evidence_class_balanced=getattr(args, "edl_wrong_evidence_class_balanced", True),
     )
 
 
@@ -1316,6 +1366,8 @@ def _run_edl_stage(
         logger.add_scalar("valid/data_loss", valid_stats["data_loss"], epoch + 1)
         logger.add_scalar("valid/unweighted_data_loss", valid_stats["unweighted_data_loss"], epoch + 1)
         logger.add_scalar("valid/kl_loss", valid_stats["kl_loss"], epoch + 1)
+        _log_epoch_loss_components(logger, "train", train_stats, epoch + 1)
+        _log_epoch_loss_components(logger, "valid", valid_stats, epoch + 1)
 
         history_values = {
             "stage": stage_name,
@@ -1350,6 +1402,8 @@ def _run_edl_stage(
             "prediction_group_cols": ",".join(_prediction_group_cols(args)),
             "best_metric_name": best_metric_name,
         }
+        _add_wrong_evidence_history(history_values, "train", train_stats)
+        _add_wrong_evidence_history(history_values, "eval", valid_stats)
         history_values.update(patient_diag)
         history_values.update(image_diag)
         history_values.update({f"train_{key}": value for key, value in train_stats.items() if key.startswith("label")})
@@ -1390,6 +1444,7 @@ def _run_edl_stage(
                 "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
                 "train_mode": getattr(args, "train_mode", "full"),
                 "freeze_backbone": getattr(args, "freeze_backbone", "n"),
+                "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
             }
             torch.save(checkpoint, _fold_best_model_path(args))
             torch.save(checkpoint, stage_best_path)
@@ -1476,6 +1531,7 @@ def _edl_staged_train_loop(args, device):
             "balanced_sampler": _balanced_sampler_mode(args),
             "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
             "edl_focal_gamma": getattr(args, "edl_focal_gamma", 0.0),
+            "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
             "prediction_aggregation": _prediction_aggregation_config(args),
             "best_metric_name": _best_metric_name(args),
             "best_checkpoint_path": str(_fold_best_model_path(args)),
@@ -1601,6 +1657,7 @@ def edl_train_loop(args, device):
             "balanced_sampler": _balanced_sampler_mode(args),
             "balanced_sampler_stats": getattr(args, "_balanced_sampler_stats", None),
             "edl_focal_gamma": getattr(args, "edl_focal_gamma", 0.0),
+            "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
             "prediction_aggregation": _prediction_aggregation_config(args),
             "best_metric_name": _best_metric_name(args),
             "best_checkpoint_path": str(_fold_best_model_path(args)),
@@ -1616,6 +1673,9 @@ def edl_train_loop(args, device):
         annealing_epochs=args.edl_annealing_epochs,
         class_weights=class_weights,
         focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
+        wrong_evidence_penalty_weight=getattr(args, "edl_wrong_evidence_penalty_weight", 0.0),
+        wrong_evidence_margin=getattr(args, "edl_wrong_evidence_margin", 0.05),
+        wrong_evidence_class_balanced=getattr(args, "edl_wrong_evidence_class_balanced", True),
     )
 
     start_epoch, best_aucroc, epochs_no_improve, history = _load_last_checkpoint_if_available(
@@ -1679,6 +1739,9 @@ def edl_train_loop(args, device):
             "focal_data_loss",
             "focal_factor_mean",
             "sample_weight_mean",
+            "wrong_evidence_penalty",
+            "margin_violation_mean",
+            "total_evidence_mean",
         ):
             if loss_key in train_stats and np.isfinite(float(train_stats[loss_key])):
                 logger.add_scalar(f"train/{loss_key}", train_stats[loss_key], epoch + 1)
@@ -1718,6 +1781,8 @@ def edl_train_loop(args, device):
             "prediction_group_cols": ",".join(_prediction_group_cols(args)),
             "best_metric_name": _best_metric_name(args),
         }
+        _add_wrong_evidence_history(history_values, "train", train_stats)
+        _add_wrong_evidence_history(history_values, "eval", valid_stats)
         history_values.update(patient_diag)
         history_values.update(image_diag)
         history_values.update({f"train_{key}": value for key, value in train_stats.items() if key.startswith("label")})
@@ -1755,6 +1820,7 @@ def edl_train_loop(args, device):
                     'bce_warmstart_path': getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
                     'train_mode': getattr(args, "train_mode", "full"),
                     'freeze_backbone': getattr(args, "freeze_backbone", "n"),
+                    'wrong_evidence_penalty': _wrong_evidence_penalty_config(args),
                 }, _fold_best_model_path(args)
             )
         else:

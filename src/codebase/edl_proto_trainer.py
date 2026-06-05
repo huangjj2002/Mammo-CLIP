@@ -64,6 +64,7 @@ from edl_trainer import (
     _threshold_diagnostics,
     _update_loss_component_meters,
     _valid_indices_from_fallback_flags,
+    _wrong_evidence_penalty_config,
     edl_get_dataloader,
     edl_valid_fn,
 )
@@ -231,6 +232,7 @@ def _save_last_checkpoint(
         "edl_proto_loss_weight": getattr(args, "edl_proto_loss_weight", 1.0),
         "edl_proto_margin": getattr(args, "edl_proto_margin", None),
         "edl_proto_balance_classes": getattr(args, "edl_proto_balance_classes", None),
+        "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
     }
     torch.save(checkpoint, _fold_last_checkpoint_path(args))
 
@@ -447,12 +449,14 @@ def _ensure_bce_warmstart(args):
             "epochs": getattr(args, "proto_warmup_epochs", None),
             "patience": getattr(args, "proto_warmup_patience", None),
             "kl_weight": 0.0,
+            "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
             "freeze_encoder": bool(getattr(args, "staged_freeze_encoder", True)),
         },
         "edl_calibration_stage": {
             "epochs": getattr(args, "epochs", None),
             "patience": getattr(args, "edl_stage_patience", getattr(args, "patience", None)),
             "kl_weight": getattr(args, "edl_kl_weight", None),
+            "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
             "freeze_encoder": bool(getattr(args, "staged_freeze_encoder", True)),
             "freeze_prototypes": bool(getattr(args, "edl_stage_freeze_prototypes", True)),
         },
@@ -924,6 +928,9 @@ def _build_edl_criterion(args, class_weights, kl_weight):
         annealing_epochs=args.edl_annealing_epochs,
         class_weights=class_weights,
         focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
+        wrong_evidence_penalty_weight=getattr(args, "edl_wrong_evidence_penalty_weight", 0.0),
+        wrong_evidence_margin=getattr(args, "edl_wrong_evidence_margin", 0.05),
+        wrong_evidence_class_balanced=getattr(args, "edl_wrong_evidence_class_balanced", True),
     )
 
 
@@ -1020,6 +1027,20 @@ def _run_training_stage(
         logger.add_scalar("train/epoch_proto_separation_loss", train_loss_stats["separation_loss"], global_epoch + 1)
         logger.add_scalar("train/epoch_proto_diversity_loss", train_loss_stats["diversity_loss"], global_epoch + 1)
         logger.add_scalar("valid/epoch_loss", avg_val_loss, global_epoch + 1)
+        for loss_key in (
+            "edl_wrong_evidence_penalty",
+            "edl_margin_violation_mean",
+            "edl_total_evidence_mean",
+        ):
+            if loss_key in train_loss_stats and np.isfinite(float(train_loss_stats[loss_key])):
+                logger.add_scalar(f"train/{loss_key}", train_loss_stats[loss_key], global_epoch + 1)
+        for loss_key in (
+            "wrong_evidence_penalty",
+            "margin_violation_mean",
+            "total_evidence_mean",
+        ):
+            if loss_key in valid_stats and np.isfinite(float(valid_stats[loss_key])):
+                logger.add_scalar(f"valid/{loss_key}", valid_stats[loss_key], global_epoch + 1)
 
         history_values = {
             "stage": stage_name,
@@ -1043,6 +1064,9 @@ def _run_training_stage(
             "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
             "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
             "eval_focal_weighted_denominator": valid_stats["focal_weighted_denominator"],
+            "eval_wrong_evidence_penalty": valid_stats["wrong_evidence_penalty"],
+            "eval_margin_violation_mean": valid_stats["margin_violation_mean"],
+            "eval_total_evidence_mean": valid_stats["total_evidence_mean"],
             "eval_skipped_batches": valid_stats["skipped_batches"],
             "prediction_threshold": threshold,
             "prediction_score_agg": _prediction_score_agg(args),
@@ -1084,6 +1108,7 @@ def _run_training_stage(
                     "training_schedule": _training_schedule(args),
                     "bce_warmstart_path": getattr(args, "_resolved_bce_warmstart_path", getattr(args, "bce_warmstart_path", None)),
                     "prototype_initialized_from": getattr(args, "_prototype_initialized_from", None),
+                    "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
                     "history": history,
                 },
                 stage_best_path,
@@ -1131,6 +1156,7 @@ def _run_training_stage(
                     "edl_proto_loss_weight": args.edl_proto_loss_weight,
                     "edl_proto_margin": args.edl_proto_margin,
                     "edl_proto_balance_classes": args.edl_proto_balance_classes,
+                    "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
                 },
                 _fold_best_model_path(args),
             )
@@ -1344,6 +1370,7 @@ def _prototype_edl_staged_train_loop(args, device):
             "bce_stage_patience": getattr(args, "bce_stage_patience", None),
             "proto_warmup_patience": getattr(args, "proto_warmup_patience", None),
             "edl_stage_patience": getattr(args, "edl_stage_patience", getattr(args, "patience", None)),
+            "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
         },
     )
 
@@ -1510,6 +1537,9 @@ def prototype_edl_train_loop(args, device):
         annealing_epochs=args.edl_annealing_epochs,
         class_weights=class_weights,
         focal_gamma=getattr(args, "edl_focal_gamma", 0.0),
+        wrong_evidence_penalty_weight=getattr(args, "edl_wrong_evidence_penalty_weight", 0.0),
+        wrong_evidence_margin=getattr(args, "edl_wrong_evidence_margin", 0.05),
+        wrong_evidence_class_balanced=getattr(args, "edl_wrong_evidence_class_balanced", True),
     )
 
     start_epoch, best_aucroc, epochs_no_improve, history = _load_last_checkpoint_if_available(
@@ -1567,6 +1597,20 @@ def prototype_edl_train_loop(args, device):
         logger.add_scalar("train/epoch_proto_separation_loss", train_loss_stats["separation_loss"], epoch + 1)
         logger.add_scalar("train/epoch_proto_diversity_loss", train_loss_stats["diversity_loss"], epoch + 1)
         logger.add_scalar("valid/epoch_loss", avg_val_loss, epoch + 1)
+        for loss_key in (
+            "edl_wrong_evidence_penalty",
+            "edl_margin_violation_mean",
+            "edl_total_evidence_mean",
+        ):
+            if loss_key in train_loss_stats and np.isfinite(float(train_loss_stats[loss_key])):
+                logger.add_scalar(f"train/{loss_key}", train_loss_stats[loss_key], epoch + 1)
+        for loss_key in (
+            "wrong_evidence_penalty",
+            "margin_violation_mean",
+            "total_evidence_mean",
+        ):
+            if loss_key in valid_stats and np.isfinite(float(valid_stats[loss_key])):
+                logger.add_scalar(f"valid/{loss_key}", valid_stats[loss_key], epoch + 1)
 
         history_values = {
             "stage": "joint",
@@ -1590,6 +1634,9 @@ def prototype_edl_train_loop(args, device):
             "eval_focal_factor_mean": valid_stats["focal_factor_mean"],
             "eval_sample_weight_mean": valid_stats["sample_weight_mean"],
             "eval_focal_weighted_denominator": valid_stats["focal_weighted_denominator"],
+            "eval_wrong_evidence_penalty": valid_stats["wrong_evidence_penalty"],
+            "eval_margin_violation_mean": valid_stats["margin_violation_mean"],
+            "eval_total_evidence_mean": valid_stats["total_evidence_mean"],
             "eval_skipped_batches": valid_stats["skipped_batches"],
             "prediction_threshold": threshold,
             "prediction_score_agg": _prediction_score_agg(args),
@@ -1648,6 +1695,7 @@ def prototype_edl_train_loop(args, device):
                     "edl_proto_loss_weight": args.edl_proto_loss_weight,
                     "edl_proto_margin": args.edl_proto_margin,
                     "edl_proto_balance_classes": args.edl_proto_balance_classes,
+                    "wrong_evidence_penalty": _wrong_evidence_penalty_config(args),
                 },
                 _fold_best_model_path(args),
             )

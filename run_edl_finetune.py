@@ -59,6 +59,9 @@ EDL_NUM_CLASSES = 2
 EDL_KL_WEIGHT = 0.1
 EDL_ANNEALING_START = 0
 EDL_ANNEALING_EPOCHS = 10
+EDL_WRONG_EVIDENCE_PENALTY_WEIGHT = 0.0
+EDL_WRONG_EVIDENCE_MARGIN = 0.05
+EDL_WRONG_EVIDENCE_CLASS_BALANCED = "y"
 EDL_DROPOUT = 0.0
 EDL_HIDDEN_DIM = None
 EDL_TRAINING_SCHEDULE = "joint"
@@ -221,6 +224,24 @@ def build_parser():
         help="Number of epochs used to anneal the EDL KL coefficient to 1.0.",
     )
     parser.add_argument(
+        "--edl-wrong-evidence-penalty-weight",
+        type=float,
+        default=EDL_WRONG_EVIDENCE_PENALTY_WEIGHT,
+        help="Weight for penalizing high evidence when the strongest probability is a wrong class. 0 disables it.",
+    )
+    parser.add_argument(
+        "--edl-wrong-evidence-margin",
+        type=float,
+        default=EDL_WRONG_EVIDENCE_MARGIN,
+        help="Margin used by the wrong-evidence penalty: relu(p_wrong - p_true + margin).",
+    )
+    parser.add_argument(
+        "--edl-wrong-evidence-class-balanced",
+        choices=["y", "n"],
+        default=EDL_WRONG_EVIDENCE_CLASS_BALANCED,
+        help="Average wrong-evidence penalty per class before averaging classes.",
+    )
+    parser.add_argument(
         "--edl-training-schedule",
         choices=["joint", "staged"],
         default=EDL_TRAINING_SCHEDULE,
@@ -289,6 +310,10 @@ def main():
         raise ValueError("--edl-annealing-start must be non-negative.")
     if cli_args.edl_annealing_epochs <= 0:
         raise ValueError("--edl-annealing-epochs must be positive.")
+    if cli_args.edl_wrong_evidence_penalty_weight < 0:
+        raise ValueError("--edl-wrong-evidence-penalty-weight must be non-negative.")
+    if cli_args.edl_wrong_evidence_margin < 0:
+        raise ValueError("--edl-wrong-evidence-margin must be non-negative.")
     if cli_args.bce_stage_epochs <= 0:
         raise ValueError("--bce-stage-epochs must be positive.")
     if cli_args.bce_stage_lr <= 0:
@@ -445,6 +470,9 @@ def main():
     args.edl_kl_weight = EDL_KL_WEIGHT
     args.edl_annealing_start = cli_args.edl_annealing_start
     args.edl_annealing_epochs = cli_args.edl_annealing_epochs
+    args.edl_wrong_evidence_penalty_weight = cli_args.edl_wrong_evidence_penalty_weight
+    args.edl_wrong_evidence_margin = cli_args.edl_wrong_evidence_margin
+    args.edl_wrong_evidence_class_balanced = cli_args.edl_wrong_evidence_class_balanced == "y"
     args.edl_dropout = EDL_DROPOUT
     args.edl_hidden_dim = EDL_HIDDEN_DIM
 
@@ -466,6 +494,12 @@ def main():
         balance_suffix_parts.append(f"thr_{args.prediction_threshold:g}")
     if args.edl_best_metric != EDL_BEST_METRIC:
         balance_suffix_parts.append(f"best_{args.edl_best_metric}")
+    if abs(args.edl_wrong_evidence_penalty_weight - EDL_WRONG_EVIDENCE_PENALTY_WEIGHT) > 1e-12:
+        balance_suffix_parts.append(
+            f"wrongev_w{args.edl_wrong_evidence_penalty_weight:g}_"
+            f"m{args.edl_wrong_evidence_margin:g}_"
+            f"bal_{'y' if args.edl_wrong_evidence_class_balanced else 'n'}"
+        )
     if args.edl_training_schedule != EDL_TRAINING_SCHEDULE:
         freeze_suffix = "freezeenc" if args.staged_freeze_encoder else "trainenc"
         balance_suffix_parts.append(
@@ -505,6 +539,9 @@ def main():
     print(f"edl_kl_weight: {args.edl_kl_weight}")
     print(f"edl_annealing_start: {args.edl_annealing_start}")
     print(f"edl_annealing_epochs: {args.edl_annealing_epochs}")
+    print(f"edl_wrong_evidence_penalty_weight: {args.edl_wrong_evidence_penalty_weight}")
+    print(f"edl_wrong_evidence_margin: {args.edl_wrong_evidence_margin}")
+    print(f"edl_wrong_evidence_class_balanced: {args.edl_wrong_evidence_class_balanced}")
     print(f"edl_dropout: {args.edl_dropout}")
     print(f"edl_hidden_dim: {args.edl_hidden_dim}")
     print(f"balanced_sampler: {args.balanced_sampler}")
