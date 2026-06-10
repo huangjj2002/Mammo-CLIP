@@ -98,6 +98,7 @@ def build_parser():
     parser.add_argument("--show-progress", "--show_progress", action="store_true")
     parser.add_argument("--n-folds", "--n_folds", type=int, default=1)
     parser.add_argument("--fold-start", "--fold_start", type=int, default=0)
+    parser.add_argument("--cv-group-col", "--cv_group_col", default="patient_id")
     parser.add_argument("--run-id", "--run_id", default=None, help="Run id appended to --output-dir. Defaults to a timestamp.")
     parser.add_argument("--no-timestamp", "--no_timestamp", action="store_true", help="Use --output-dir exactly as provided.")
     return parser
@@ -232,6 +233,100 @@ def assign_splits(meta, args):
             split.iloc[val_idx] = "val"
 
     return split
+
+
+def infer_test_mask(meta, args):
+    test_mask = pd.Series(False, index=meta.index)
+
+    if args.split_col in meta.columns:
+        raw = meta[args.split_col].astype(str).str.strip().str.lower()
+        test_mask |= raw == "test"
+
+    if args.fold_col in meta.columns:
+        fold = pd.to_numeric(meta[args.fold_col], errors="coerce")
+        test_mask |= fold == -1
+
+    if args.cohort_col in meta.columns:
+        cohort = pd.to_numeric(meta[args.cohort_col], errors="coerce")
+        test_mask |= cohort.isin(parse_int_set(args.test_cohorts))
+
+    return test_mask
+
+
+def assign_cv_splits(meta, args):
+    if args.cv_group_col not in meta.columns:
+        raise ValueError(f"Patient-safe CV requires group column '{args.cv_group_col}' in metadata.")
+
+    split = pd.Series("train", index=meta.index, dtype="object")
+    test_mask = infer_test_mask(meta, args)
+    split.loc[test_mask] = "test"
+    train_val_mask = ~test_mask
+
+    if args.fold_col in meta.columns:
+        fold = pd.to_numeric(meta[args.fold_col], errors="coerce")
+        val_mask = train_val_mask & (fold == int(args.val_fold))
+        if val_mask.any():
+            split.loc[val_mask] = "val"
+            validate_cv_group_split(meta, split, args.cv_group_col)
+            return split, "metadata_fold"
+
+        present_folds = sorted(
+            int(value)
+            for value in fold[train_val_mask].dropna().unique().tolist()
+            if int(value) != -1
+        )
+        if present_folds:
+            raise ValueError(
+                f"No rows with {args.fold_col} == {args.val_fold}. "
+                f"Available folds: {present_folds}. Try --fold_start {min(present_folds)}."
+            )
+
+    n_folds = int(getattr(args, "_cv_n_folds", args.n_folds))
+    rel_fold = int(args.val_fold) - int(args.fold_start)
+    if rel_fold < 0 or rel_fold >= n_folds:
+        raise ValueError(f"Generated CV fold index {rel_fold} is outside [0, {n_folds - 1}].")
+
+    pool_idx = np.flatnonzero(train_val_mask.values)
+    if len(pool_idx) < n_folds:
+        raise ValueError(f"Cannot generate {n_folds} folds from only {len(pool_idx)} train/val rows.")
+
+    labels = meta[args.label].astype(int).to_numpy()
+    group_labels = (
+        meta.iloc[pool_idx]
+        .assign(_label=labels[pool_idx])
+        .groupby(args.cv_group_col, dropna=False)["_label"]
+        .max()
+    )
+    group_values = group_labels.index.to_numpy()
+    group_y = group_labels.to_numpy(dtype=int)
+    if len(group_values) < n_folds:
+        raise ValueError(f"Cannot generate {n_folds} folds from only {len(group_values)} {args.cv_group_col} groups.")
+
+    rng = np.random.default_rng(args.seed)
+    val_groups = []
+    for class_id in np.unique(group_y):
+        class_groups = group_values[group_y == class_id].copy()
+        rng.shuffle(class_groups)
+        folds = np.array_split(class_groups, n_folds)
+        val_groups.extend(folds[rel_fold].tolist())
+
+    if not val_groups:
+        raise ValueError("Generated CV validation split is empty.")
+    val_group_set = set(val_groups)
+    split.loc[train_val_mask & meta[args.cv_group_col].isin(val_group_set)] = "val"
+    validate_cv_group_split(meta, split, args.cv_group_col)
+    return split, f"generated_group_stratified:{args.cv_group_col}"
+
+
+def validate_cv_group_split(meta, split, group_col):
+    grouped_splits = split.groupby(meta[group_col], dropna=False).agg(lambda values: set(values))
+    leaked = grouped_splits[grouped_splits.map(len) > 1]
+    if not leaked.empty:
+        examples = [str(value) for value in leaked.index[:5].tolist()]
+        raise ValueError(
+            f"Patient leakage detected: {group_col} appears in multiple splits. "
+            f"Example groups: {examples}"
+        )
 
 
 def stratified_sample_positions(meta, label_col, split_col, max_samples, seed):
@@ -923,15 +1018,14 @@ def run_single(args):
         raise ValueError(f"metadata rows ({len(meta)}) != embeddings rows ({len(embeddings)})")
     if args.label not in meta.columns:
         raise ValueError(f"metadata is missing label column: {args.label}")
-    if getattr(args, "_cv_mode", False):
-        if args.fold_col not in meta.columns:
-            raise ValueError(f"5-fold CV requires fold column '{args.fold_col}' in metadata.")
-        fold_values = pd.to_numeric(meta[args.fold_col], errors="coerce")
-        if not (fold_values == int(args.val_fold)).any():
-            raise ValueError(f"5-fold CV found no rows with {args.fold_col} == {args.val_fold}.")
-
     meta = meta.copy().reset_index(drop=True)
-    meta["dst_split"] = assign_splits(meta, args)
+    if getattr(args, "_cv_mode", False):
+        meta["dst_split"], cv_fold_source = assign_cv_splits(meta, args)
+        args._cv_fold_source = cv_fold_source
+        print(f"[CV] split source: {cv_fold_source}")
+    else:
+        meta["dst_split"] = assign_splits(meta, args)
+        args._cv_fold_source = None
     original_num_rows = int(len(meta))
     sample_positions = stratified_sample_positions(meta, args.label, "dst_split", args.max_samples, args.seed)
     if len(sample_positions) < len(meta):
@@ -1119,6 +1213,10 @@ def run_single(args):
         "gpu_id": args.gpu_id,
         "effective_device": str(device),
         "split_counts": split_counts,
+        "cv_mode": bool(getattr(args, "_cv_mode", False)),
+        "cv_fold": int(args.val_fold) if getattr(args, "_cv_mode", False) else None,
+        "cv_fold_source": getattr(args, "_cv_fold_source", None),
+        "cv_group_col": args.cv_group_col,
         "label_counts": label_counts,
         "prototypes_per_class": int(args.prototypes_per_class),
         "prototype_topk": int(args.prototype_topk),
@@ -1202,6 +1300,7 @@ def main():
     fold_metrics = []
     for fold in range(int(args.fold_start), int(args.fold_start) + int(args.n_folds)):
         fold_args = copy.deepcopy(args)
+        fold_args._cv_n_folds = args.n_folds
         fold_args.n_folds = 1
         fold_args._cv_mode = True
         fold_args.split_mode = "fold"
