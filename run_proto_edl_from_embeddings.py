@@ -13,9 +13,11 @@ Outputs:
 """
 
 import argparse
+import copy
 import json
 import os
 import random
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +28,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
@@ -94,6 +101,11 @@ def build_parser():
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
     parser.add_argument("--gpu-id", "--gpu_id", type=int, default=None)
     parser.add_argument("--num-workers", "--num_workers", type=int, default=0)
+    parser.add_argument("--show-progress", "--show_progress", action="store_true")
+    parser.add_argument("--n-folds", "--n_folds", type=int, default=1)
+    parser.add_argument("--fold-start", "--fold_start", type=int, default=0)
+    parser.add_argument("--run-id", "--run_id", default=None, help="Run id appended to --output-dir. Defaults to a timestamp.")
+    parser.add_argument("--no-timestamp", "--no_timestamp", action="store_true", help="Use --output-dir exactly as provided.")
     return parser
 
 
@@ -102,6 +114,21 @@ def resolve_path(path):
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return path.resolve()
+
+
+def resolve_run_id(run_id=None):
+    if run_id is None or str(run_id).strip() == "":
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id).strip())
+    return run_id.strip("_") or datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def timestamped_output_dir(output_dir, args):
+    base_dir = resolve_path(output_dir)
+    if getattr(args, "no_timestamp", False):
+        return base_dir, None
+    run_id = resolve_run_id(getattr(args, "run_id", None))
+    return base_dir.with_name(f"{base_dir.name}_run_{run_id}"), run_id
 
 
 def set_seed(seed):
@@ -456,6 +483,12 @@ def make_loader(features, labels, positions, batch_size, shuffle, seed, num_work
     )
 
 
+def maybe_progress(iterable, args, desc):
+    if not getattr(args, "show_progress", False) or tqdm is None:
+        return iterable
+    return tqdm(iterable, desc=desc, total=len(iterable), leave=False, dynamic_ncols=True)
+
+
 def choose_device(args):
     if args.gpu_id is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
@@ -584,7 +617,7 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, args):
         "proto_separation_loss": 0.0,
         "proto_diversity_loss": 0.0,
     }
-    for features, labels, _ in loader:
+    for features, labels, _ in maybe_progress(loader, args, "train"):
         features = features.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -623,7 +656,7 @@ def predict_to_frame(meta, features, labels, positions, model, criterion, args, 
     loss_n = 0
 
     with torch.no_grad():
-        for batch_features, batch_labels, batch_rows in loader:
+        for batch_features, batch_labels, batch_rows in maybe_progress(loader, args, "predict"):
             batch_features = batch_features.to(device, non_blocking=True)
             batch_labels = batch_labels.to(device, non_blocking=True)
             evidence, details = model(batch_features, return_details=True)
@@ -701,8 +734,7 @@ def torch_load(path, map_location):
         return torch.load(path, map_location=map_location)
 
 
-def main():
-    args = build_parser().parse_args()
+def run_single(args):
     if args.epochs <= 0:
         raise ValueError("--epochs must be positive.")
     if args.batch_size <= 0:
@@ -713,6 +745,8 @@ def main():
         raise ValueError("--prototype-temperature must be positive.")
     if args.patience < 0:
         raise ValueError("--patience must be non-negative.")
+    if args.n_folds <= 0:
+        raise ValueError("--n-folds must be positive.")
     for name in ["proto_attract_weight", "proto_separation_weight", "proto_diversity_weight", "proto_loss_weight"]:
         if getattr(args, name) < 0:
             raise ValueError(f"--{name.replace('_', '-')} must be non-negative.")
@@ -732,6 +766,12 @@ def main():
         raise ValueError(f"metadata rows ({len(meta)}) != embeddings rows ({len(embeddings)})")
     if args.label not in meta.columns:
         raise ValueError(f"metadata is missing label column: {args.label}")
+    if getattr(args, "_cv_mode", False):
+        if args.fold_col not in meta.columns:
+            raise ValueError(f"5-fold CV requires fold column '{args.fold_col}' in metadata.")
+        fold_values = pd.to_numeric(meta[args.fold_col], errors="coerce")
+        if not (fold_values == int(args.val_fold)).any():
+            raise ValueError(f"5-fold CV found no rows with {args.fold_col} == {args.val_fold}.")
 
     meta = meta.copy().reset_index(drop=True)
     meta["proto_edl_split"] = assign_splits(meta, args)
@@ -784,6 +824,10 @@ def main():
 
     prototype_initialized_from = "random"
     if args.prototype_init == "kmeans":
+        print(
+            "Initializing prototypes with KMeans "
+            f"(train_rows={len(train_positions)}, k={args.prototypes_per_class} per class)..."
+        )
         prototypes = classwise_prototypes(
             features[train_positions],
             labels[train_positions],
@@ -946,7 +990,10 @@ def main():
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "embedding_path": str(embedding_path),
         "metadata_path": str(metadata_path),
+        "requested_output_dir": getattr(args, "_requested_output_dir", str(output_dir)),
         "output_dir": str(output_dir),
+        "run_id": getattr(args, "_resolved_run_id", None),
+        "timestamped_output_dir": not bool(getattr(args, "no_timestamp", False)),
         "label": args.label,
         "original_num_rows": original_num_rows,
         "num_rows": int(len(meta)),
@@ -991,6 +1038,65 @@ def main():
     print(f"  manifest:    {manifest_path}")
     if not metrics_df.empty:
         print(metrics_df.to_string(index=False))
+    return metrics_df, manifest
+
+
+def write_cv_summary(base_output_dir, fold_metrics):
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    cv_metrics = pd.concat(fold_metrics, ignore_index=True)
+    cv_metrics_path = base_output_dir / "cv_metrics.csv"
+    cv_metrics.to_csv(cv_metrics_path, index=False)
+
+    group_cols = [col for col in ["split", "grain", "score_agg"] if col in cv_metrics.columns]
+    numeric_cols = [
+        col
+        for col in cv_metrics.select_dtypes(include=[np.number]).columns
+        if col != "cv_fold"
+    ]
+    summary_path = base_output_dir / "cv_metrics_summary.csv"
+    if group_cols and numeric_cols:
+        summary = cv_metrics.groupby(group_cols, dropna=False)[numeric_cols].agg(["mean", "std"])
+        summary.columns = [f"{metric}_{stat}" for metric, stat in summary.columns]
+        summary = summary.reset_index()
+        summary.to_csv(summary_path, index=False)
+    else:
+        summary = pd.DataFrame()
+        summary.to_csv(summary_path, index=False)
+
+    print("\nCross-validation done.")
+    print(f"  cv metrics:  {cv_metrics_path}")
+    print(f"  cv summary:  {summary_path}")
+    if not summary.empty:
+        print(summary.to_string(index=False))
+    return cv_metrics, summary
+
+
+def main():
+    args = build_parser().parse_args()
+    args._requested_output_dir = args.output_dir
+    resolved_output_dir, resolved_run_id = timestamped_output_dir(args.output_dir, args)
+    args.output_dir = str(resolved_output_dir)
+    args._resolved_run_id = resolved_run_id
+    if args.n_folds <= 1:
+        run_single(args)
+        return
+
+    base_output_dir = resolve_path(args.output_dir)
+    fold_metrics = []
+    for fold in range(int(args.fold_start), int(args.fold_start) + int(args.n_folds)):
+        fold_args = copy.deepcopy(args)
+        fold_args.n_folds = 1
+        fold_args._cv_mode = True
+        fold_args.split_mode = "fold"
+        fold_args.val_fold = fold
+        fold_args.output_dir = str(base_output_dir / f"fold_{fold}")
+        print(f"\n[CV] Fold {fold} / {args.fold_start + args.n_folds - 1}")
+        metrics_df, _ = run_single(fold_args)
+        metrics_df = metrics_df.copy()
+        metrics_df.insert(0, "cv_fold", fold)
+        fold_metrics.append(metrics_df)
+
+    write_cv_summary(base_output_dir, fold_metrics)
 
 
 if __name__ == "__main__":

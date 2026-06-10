@@ -103,8 +103,17 @@ EDL_STAGE_FREEZE_PROTOTYPES = "y"
 
 import argparse
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime
+
+
+def resolve_launcher_run_id(run_id=None):
+    if run_id is None or str(run_id).strip() == "":
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id).strip())
+    return run_id.strip("_") or datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def ensure_nltk_punkt():
@@ -429,6 +438,8 @@ def build_parser():
 
 def main():
     cli_args = build_parser().parse_args()
+    explicit_run_id = cli_args.run_id is not None and str(cli_args.run_id).strip() != ""
+    cli_args.run_id = resolve_launcher_run_id(cli_args.run_id)
     if cli_args.edl_focal_gamma < 0:
         raise ValueError("--edl-focal-gamma must be non-negative.")
     if cli_args.effective_beta < 0 or cli_args.effective_beta >= 1:
@@ -679,7 +690,7 @@ def main():
         f"m{args.edl_proto_margin}_bal_{'y' if args.edl_proto_balance_classes else 'n'}_mode_{args.train_mode}"
         f"{balance_suffix}"
     )
-    args.root, args.run_id = append_run_id(base_root, cli_args.run_id, compact=cli_args.run_id is not None)
+    args.root, args.run_id = append_run_id(base_root, cli_args.run_id, compact=explicit_run_id)
     chk_pt_path = Path(args.checkpoints) / args.dataset / "prototype_edl_classifier" / args.arch / args.root
     output_path = Path(args.output_path) / args.dataset / "zz" / "prototype_edl_classifier" / args.arch / args.root
     tb_logs_path = Path(args.tensorboard_path) / args.dataset / "prototype_edl_classifier" / args.arch / args.root

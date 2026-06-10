@@ -1,7 +1,16 @@
 import argparse
 import os
+import re
 import subprocess
 import sys
+from datetime import datetime
+
+
+def resolve_launcher_run_id(run_id=None):
+    if run_id is None or str(run_id).strip() == "":
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(run_id).strip())
+    return run_id.strip("_") or datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 CSV_PATH = r"/home/dhao4/workspace/hjj_workspace/data/data.csv"
@@ -125,6 +134,7 @@ def build_parser():
 
 def main():
     cli_args = build_parser().parse_args()
+    cli_args.run_id = resolve_launcher_run_id(cli_args.run_id)
     ensure_nltk_punkt()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(cli_args.gpu_id)
@@ -213,8 +223,8 @@ def main():
         "--device", cli_args.device,
         "--apex", cli_args.apex,
     ]
-    if cli_args.run_id:
-        train_cmd.extend(["--run-id", cli_args.run_id])
+    train_cmd.extend(["--run-id", cli_args.run_id])
+    print(f"run_id: {cli_args.run_id}")
     print(f"Running: {' '.join(train_cmd)}")
     result = subprocess.run(train_cmd, cwd=codebase_dir)
     if result.returncode != 0:
