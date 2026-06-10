@@ -1,5 +1,5 @@
 """
-Run a lightweight Dempster-Shafer-style prototype classifier on cached embeddings.
+Train a Prototype-DST head directly on cached Mammo-CLIP embeddings.
 
 Input bundle:
   - embeddings.npy
@@ -8,56 +8,86 @@ Input bundle:
 Outputs:
   - dst_all_predictions.csv
   - dst_metrics.csv
+  - dst_best.pt
   - dst_manifest.json
-  - dst_prototypes.npz
 """
 
 import argparse
 import json
+import os
+import random
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+from dst_pytorch import Dempster_Shafer_Module, DistanceActivation_layer
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Run prototype DST from cached Mammo-CLIP embeddings.")
+    parser = argparse.ArgumentParser(description="Train Prototype-DST from cached Mammo-CLIP embeddings.")
     parser.add_argument("--embedding-dir", default="embeddings/origin_finetuned_encoder")
     parser.add_argument("--embeddings", default=None, help="Path to embeddings.npy. Overrides --embedding-dir.")
     parser.add_argument("--metadata", default=None, help="Path to metadata.csv. Overrides --embedding-dir.")
     parser.add_argument("--output-dir", default="dst_results/origin_finetuned_dst")
     parser.add_argument("--label", default="cancer")
-    parser.add_argument("--prototypes-per-class", type=int, default=10)
+    parser.add_argument("--prototypes-per-class", "--prototypes_per_class", type=int, default=10)
+    parser.add_argument("--prototype-topk", "--prototype_topk", type=int, default=3)
+    parser.add_argument("--prototype-init", "--prototype_init", choices=["kmeans", "random"], default="kmeans")
+    parser.add_argument("--dst-gamma-init", "--dst_gamma_init", type=float, default=1.0)
+    parser.add_argument("--dst-alpha-init", "--dst_alpha_init", type=float, default=0.0)
     parser.add_argument(
         "--temperature",
-        default="auto",
-        help="Positive float or 'auto'. Auto chooses temperature on validation BACC@threshold.",
+        default=None,
+        help="Backward-compatible distance temperature. A positive value maps to gamma_init=1/temperature; 'auto' uses --dst-gamma-init.",
     )
+    parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--no-normalize", action="store_true", help="Disable L2 normalization in the DST head.")
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", "--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=512)
     parser.add_argument(
-        "--temperature-grid",
-        default="0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100",
-        help="Comma-separated candidate temperatures used when --temperature auto.",
+        "--patience",
+        "--early-stopping-patience",
+        "--early_stopping_patience",
+        type=int,
+        default=10,
     )
-    parser.add_argument("--uncertainty-strength", type=float, default=1.0)
+    parser.add_argument("--class-weight-mode", "--class_weight_mode", choices=["none", "inverse", "effective"], default="inverse")
+    parser.add_argument("--effective-beta", "--effective_beta", type=float, default=0.9999)
+    parser.add_argument("--proto-attract-weight", "--proto_attract_weight", type=float, default=0.0)
+    parser.add_argument("--proto-separation-weight", "--proto_separation_weight", type=float, default=0.0)
+    parser.add_argument("--proto-diversity-weight", "--proto_diversity_weight", type=float, default=0.0)
+    parser.add_argument("--proto-loss-weight", "--proto_loss_weight", type=float, default=1.0)
+    parser.add_argument("--proto-margin", "--proto_margin", type=float, default=1.0)
+    parser.add_argument("--proto-balance-classes", "--proto_balance_classes", choices=["y", "n"], default="y")
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--no-normalize", action="store_true", help="Disable L2 normalization before fitting DST.")
-    parser.add_argument("--split-mode", choices=["auto", "metadata", "cohort", "fold"], default="auto")
-    parser.add_argument("--split-col", default="split")
-    parser.add_argument("--fold-col", default="fold")
-    parser.add_argument("--val-fold", type=int, default=0)
-    parser.add_argument("--cohort-col", default="cohort_num")
-    parser.add_argument("--train-cohorts", default="1-8")
-    parser.add_argument("--test-cohorts", default="9-10")
-    parser.add_argument("--holdout-val-percent", type=float, default=20.0)
+    parser.add_argument("--best-metric", "--best_metric", choices=["bacc", "auc", "loss"], default="bacc")
+    parser.add_argument("--split-mode", "--split_mode", choices=["auto", "metadata", "cohort", "fold"], default="auto")
+    parser.add_argument("--split-col", "--split_col", default="split")
+    parser.add_argument("--fold-col", "--fold_col", default="fold")
+    parser.add_argument("--val-fold", "--val_fold", type=int, default=0)
+    parser.add_argument("--cohort-col", "--cohort_col", default="cohort_num")
+    parser.add_argument("--train-cohorts", "--train_cohorts", default="1-8")
+    parser.add_argument("--test-cohorts", "--test_cohorts", default="9-10")
+    parser.add_argument("--holdout-val-percent", "--holdout_val_percent", type=float, default=20.0)
+    parser.add_argument("--group-cols", "--group_cols", default="patient_id")
+    parser.add_argument("--score-agg", "--score_agg", choices=["mean", "max"], default="mean")
+    parser.add_argument("--max-samples", "--max_samples", type=int, default=None)
+    parser.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--group-cols", default="patient_id")
-    parser.add_argument("--score-agg", choices=["mean", "max"], default="mean")
-    parser.add_argument("--max-train-samples", type=int, default=None)
-    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
+    parser.add_argument("--gpu-id", "--gpu_id", type=int, default=None)
+    parser.add_argument("--num-workers", "--num_workers", type=int, default=0)
     return parser
 
 
@@ -66,6 +96,25 @@ def resolve_path(path):
     if not path.is_absolute():
         path = PROJECT_ROOT / path
     return path.resolve()
+
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def choose_device(args):
+    if args.gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
+    if args.device == "auto":
+        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("[WARN] CUDA requested but unavailable; using CPU.")
+        return torch.device("cpu")
+    return torch.device(args.device)
 
 
 def parse_int_set(spec):
@@ -98,7 +147,7 @@ def stratified_holdout_indices(indices, labels, val_fraction, seed):
     labels = np.asarray(labels).astype(int)
     val_indices = []
     for class_id in np.unique(labels):
-        class_indices = indices[labels == class_id]
+        class_indices = indices[labels == class_id].copy()
         if len(class_indices) == 0:
             continue
         rng.shuffle(class_indices)
@@ -114,58 +163,6 @@ def stratified_holdout_indices(indices, labels, val_fraction, seed):
         n_val = max(1, int(round(len(shuffled) * val_fraction)))
         val_indices = shuffled[:n_val].tolist()
     return np.asarray(val_indices, dtype=int)
-
-
-def simple_kmeans(x, k, seed, max_iter=100):
-    x = np.asarray(x, dtype=np.float32)
-    rng = np.random.default_rng(seed)
-    if len(x) < k:
-        raise ValueError("simple_kmeans requires len(x) >= k")
-    init_idx = rng.choice(len(x), size=k, replace=False)
-    centers = x[init_idx].copy()
-    labels = np.full(len(x), -1, dtype=np.int64)
-    for _ in range(max_iter):
-        dist = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        new_labels = dist.argmin(axis=1)
-        if np.array_equal(new_labels, labels):
-            break
-        labels = new_labels
-        for cluster_id in range(k):
-            mask = labels == cluster_id
-            if mask.any():
-                centers[cluster_id] = x[mask].mean(axis=0)
-            else:
-                centers[cluster_id] = x[rng.integers(0, len(x))]
-    return centers.astype(np.float32)
-
-
-def average_ranks(values):
-    values = np.asarray(values)
-    order = np.argsort(values, kind="mergesort")
-    ranks = np.empty(len(values), dtype=float)
-    sorted_values = values[order]
-    start = 0
-    while start < len(values):
-        end = start + 1
-        while end < len(values) and sorted_values[end] == sorted_values[start]:
-            end += 1
-        avg_rank = 0.5 * (start + 1 + end)
-        ranks[order[start:end]] = avg_rank
-        start = end
-    return ranks
-
-
-def roc_auc_numpy(y_true, score):
-    y_true = np.asarray(y_true).astype(int)
-    score = np.asarray(score, dtype=float)
-    n_pos = int((y_true == 1).sum())
-    n_neg = int((y_true == 0).sum())
-    if n_pos == 0 or n_neg == 0:
-        return float("nan")
-    ranks = average_ranks(score)
-    pos_rank_sum = ranks[y_true == 1].sum()
-    auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
-    return float(auc)
 
 
 def assign_splits(meta, args):
@@ -210,80 +207,132 @@ def assign_splits(meta, args):
     return split
 
 
-def attach_prediction_columns(pred_df, label_col, score_col, group_cols, score_agg, threshold):
-    missing = [col for col in group_cols if col not in pred_df.columns]
-    if missing:
-        raise KeyError(f"Missing column(s) for grouped predictions: {missing}")
+def stratified_sample_positions(meta, label_col, split_col, max_samples, seed):
+    if max_samples is None or len(meta) <= max_samples:
+        return np.arange(len(meta), dtype=int)
+    if max_samples <= 0:
+        raise ValueError("--max-samples must be positive.")
 
-    result_df = pred_df.copy()
-    result_df["image_prediction_prob"] = result_df[score_col]
-    result_df["patient_prediction_prob"] = result_df.groupby(group_cols, dropna=False)[
-        "image_prediction_prob"
-    ].transform(score_agg)
-    result_df["prediction_prob"] = result_df["patient_prediction_prob"]
-    result_df["prediction_label"] = (result_df["prediction_prob"] >= threshold).astype(int)
-    result_df["prediction_group_cols"] = ",".join(group_cols)
-    result_df["prediction_score_agg"] = score_agg
-    result_df["prediction_threshold"] = float(threshold)
-    result_df["prediction_image_score_col"] = "image_prediction_prob"
-    return result_df
+    rng = np.random.default_rng(seed)
+    selected = []
+    total = len(meta)
+    group_keys = meta[[split_col, label_col]].astype(str).agg("|".join, axis=1)
+    positions = pd.Series(np.arange(total, dtype=int), index=meta.index)
+    for _, group_positions in positions.groupby(group_keys, sort=False):
+        group_values = group_positions.to_numpy(dtype=int)
+        quota = int(round(len(group_values) * max_samples / total))
+        quota = min(len(group_values), max(1, quota))
+        selected.extend(rng.choice(group_values, size=quota, replace=False).tolist())
+
+    selected = np.asarray(sorted(set(selected)), dtype=int)
+    if len(selected) > max_samples:
+        selected = np.sort(rng.choice(selected, size=max_samples, replace=False))
+    elif len(selected) < max_samples:
+        remaining = np.setdiff1d(np.arange(total, dtype=int), selected, assume_unique=False)
+        fill = min(len(remaining), max_samples - len(selected))
+        if fill > 0:
+            selected = np.sort(np.concatenate([selected, rng.choice(remaining, size=fill, replace=False)]))
+    return selected
+
+
+def stratified_limit_positions(positions, labels, max_count, seed):
+    positions = np.asarray(positions, dtype=int)
+    if max_count is None or len(positions) <= max_count:
+        return positions
+    if max_count <= 0:
+        raise ValueError("--max-train-samples must be positive.")
+
+    rng = np.random.default_rng(seed)
+    selected = []
+    labels = np.asarray(labels).astype(int)
+    for class_id in np.unique(labels[positions]):
+        class_positions = positions[labels[positions] == class_id]
+        quota = int(round(len(class_positions) * max_count / len(positions)))
+        quota = min(len(class_positions), max(1, quota))
+        selected.extend(rng.choice(class_positions, size=quota, replace=False).tolist())
+
+    selected = np.asarray(sorted(set(selected)), dtype=int)
+    if len(selected) > max_count:
+        selected = np.sort(rng.choice(selected, size=max_count, replace=False))
+    elif len(selected) < max_count:
+        remaining = np.setdiff1d(positions, selected, assume_unique=False)
+        fill = min(len(remaining), max_count - len(selected))
+        if fill > 0:
+            selected = np.sort(np.concatenate([selected, rng.choice(remaining, size=fill, replace=False)]))
+    return selected
+
+
+def simple_kmeans(x, k, seed, max_iter=100):
+    x = np.asarray(x, dtype=np.float32)
+    rng = np.random.default_rng(seed)
+    if len(x) < k:
+        raise ValueError("simple_kmeans requires len(x) >= k")
+    init_idx = rng.choice(len(x), size=k, replace=False)
+    centers = x[init_idx].copy()
+    labels = np.full(len(x), -1, dtype=np.int64)
+    for _ in range(max_iter):
+        dist = ((x[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        new_labels = dist.argmin(axis=1)
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+        for cluster_id in range(k):
+            mask = labels == cluster_id
+            if mask.any():
+                centers[cluster_id] = x[mask].mean(axis=0)
+            else:
+                centers[cluster_id] = x[rng.integers(0, len(x))]
+    return centers.astype(np.float32)
 
 
 def classwise_prototypes(x_train, y_train, prototypes_per_class, seed):
-    prototypes = []
-    prototype_labels = []
+    centers = []
     for class_id in [0, 1]:
         class_x = x_train[y_train == class_id]
         if len(class_x) == 0:
-            raise ValueError(f"No training rows for class {class_id}; cannot fit class-wise DST prototypes.")
+            raise ValueError(f"No training rows for class {class_id}; cannot initialize class-wise DST prototypes.")
 
         k = int(prototypes_per_class)
         if k <= 0:
             raise ValueError("--prototypes-per-class must be positive.")
         if k == 1:
-            centers = class_x.mean(axis=0, keepdims=True)
+            class_centers = class_x.mean(axis=0, keepdims=True)
         elif len(class_x) >= k:
-            centers = simple_kmeans(class_x, k, seed + class_id)
+            class_centers = simple_kmeans(class_x, k, seed + class_id)
         else:
             repeat_count = int(np.ceil(k / len(class_x)))
-            centers = np.tile(class_x, (repeat_count, 1))[:k]
-        prototypes.append(centers.astype(np.float32))
-        prototype_labels.extend([class_id] * len(centers))
-
-    return np.vstack(prototypes).astype(np.float32), np.asarray(prototype_labels, dtype=np.int64)
+            class_centers = np.tile(class_x, (repeat_count, 1))[:k]
+        centers.append(class_centers.astype(np.float32))
+    return torch.tensor(np.stack(centers, axis=0), dtype=torch.float32)
 
 
-def dst_predict(x, prototypes, prototype_labels, temperature, uncertainty_strength, batch_size):
-    out = {
-        "mass_0": np.zeros(len(x), dtype=np.float32),
-        "mass_1": np.zeros(len(x), dtype=np.float32),
-        "uncertainty": np.zeros(len(x), dtype=np.float32),
-        "probability_1": np.zeros(len(x), dtype=np.float32),
-    }
+def average_ranks(values):
+    values = np.asarray(values)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(len(values), dtype=float)
+    sorted_values = values[order]
+    start = 0
+    while start < len(values):
+        end = start + 1
+        while end < len(values) and sorted_values[end] == sorted_values[start]:
+            end += 1
+        avg_rank = 0.5 * (start + 1 + end)
+        ranks[order[start:end]] = avg_rank
+        start = end
+    return ranks
 
-    temp = max(float(temperature), 1e-12)
-    uncertainty_strength = max(float(uncertainty_strength), 1e-12)
-    proto0 = prototypes[prototype_labels == 0]
-    proto1 = prototypes[prototype_labels == 1]
 
-    for start in range(0, len(x), batch_size):
-        end = min(start + batch_size, len(x))
-        xb = np.asarray(x[start:end], dtype=np.float32)
-        dist0 = ((xb[:, None, :] - proto0[None, :, :]) ** 2).sum(axis=2)
-        dist1 = ((xb[:, None, :] - proto1[None, :, :]) ** 2).sum(axis=2)
-        support0 = np.exp(-dist0 / temp).mean(axis=1)
-        support1 = np.exp(-dist1 / temp).mean(axis=1)
-        denom = support0 + support1 + uncertainty_strength
-        mass0 = support0 / denom
-        mass1 = support1 / denom
-        uncertainty = uncertainty_strength / denom
-        probability_1 = mass1 + 0.5 * uncertainty
-
-        out["mass_0"][start:end] = mass0
-        out["mass_1"][start:end] = mass1
-        out["uncertainty"][start:end] = uncertainty
-        out["probability_1"][start:end] = probability_1
-    return out
+def roc_auc_numpy(y_true, score):
+    y_true = np.asarray(y_true).astype(int)
+    score = np.asarray(score, dtype=float)
+    n_pos = int((y_true == 1).sum())
+    n_neg = int((y_true == 0).sum())
+    if n_pos == 0 or n_neg == 0:
+        return float("nan")
+    ranks = average_ranks(score)
+    pos_rank_sum = ranks[y_true == 1].sum()
+    auc = (pos_rank_sum - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
 
 
 def binary_metrics(y_true, score, threshold):
@@ -314,8 +363,30 @@ def grouped_frame(pred_df, label_col, score_col, group_cols, score_agg):
     missing = [col for col in group_cols if col not in pred_df.columns]
     if missing:
         return None
-    grouped = pred_df.groupby(group_cols, dropna=False).agg({label_col: "max", score_col: score_agg}).reset_index()
-    return grouped
+    return (
+        pred_df.groupby(group_cols, dropna=False)
+        .agg({label_col: "max", score_col: score_agg})
+        .reset_index()
+    )
+
+
+def attach_prediction_columns(pred_df, label_col, score_col, group_cols, score_agg, threshold):
+    missing = [col for col in group_cols if col not in pred_df.columns]
+    if missing:
+        raise KeyError(f"Missing column(s) for grouped predictions: {missing}")
+
+    result_df = pred_df.copy()
+    result_df["image_prediction_prob"] = result_df[score_col]
+    result_df["patient_prediction_prob"] = result_df.groupby(group_cols, dropna=False)[
+        "image_prediction_prob"
+    ].transform(score_agg)
+    result_df["prediction_prob"] = result_df["patient_prediction_prob"]
+    result_df["prediction_label"] = (result_df["prediction_prob"] >= threshold).astype(int)
+    result_df["prediction_group_cols"] = ",".join(group_cols)
+    result_df["prediction_score_agg"] = score_agg
+    result_df["prediction_threshold"] = float(threshold)
+    result_df["prediction_image_score_col"] = "image_prediction_prob"
+    return result_df
 
 
 def evaluate_predictions(pred_df, args):
@@ -342,32 +413,470 @@ def evaluate_predictions(pred_df, args):
     return pd.DataFrame(rows)
 
 
-def tune_temperature(x_val, y_val, prototypes, prototype_labels, args):
-    candidates = [float(item.strip()) for item in args.temperature_grid.split(",") if item.strip()]
-    best_temperature = candidates[0]
-    best_bacc = -np.inf
-    best_auc = -np.inf
-    for temp in candidates:
-        pred = dst_predict(
-            x_val,
-            prototypes,
-            prototype_labels,
-            temp,
-            args.uncertainty_strength,
-            args.batch_size,
+class EmbeddingDataset(Dataset):
+    def __init__(self, features, labels, positions):
+        self.features = features
+        self.labels = np.asarray(labels).astype(np.int64)
+        self.positions = np.asarray(positions, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __getitem__(self, index):
+        row = int(self.positions[index])
+        feature = torch.from_numpy(np.asarray(self.features[row], dtype=np.float32))
+        label = int(self.labels[row])
+        return feature, label, row
+
+
+def make_loader(features, labels, positions, batch_size, shuffle, seed, num_workers):
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return DataLoader(
+        EmbeddingDataset(features, labels, positions),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+        generator=generator if shuffle else None,
+    )
+
+
+def pignistic(mass, num_classes):
+    class_mass = mass[..., :num_classes]
+    omega = mass[..., num_classes]
+    prob = class_mass + omega.unsqueeze(-1) / float(num_classes)
+    return prob, omega
+
+
+def dst_activation_init_gamma(gamma_init):
+    return np.sqrt(max(float(gamma_init), 1e-6))
+
+
+def dst_activation_init_alpha(alpha_init):
+    return float(alpha_init)
+
+
+class PrototypeDSTHead(nn.Module):
+    def __init__(
+        self,
+        feature_dim,
+        num_classes=2,
+        prototypes_per_class=10,
+        topk=3,
+        gamma_init=1.0,
+        alpha_init=0.0,
+        normalize=True,
+        dropout=0.0,
+    ):
+        super().__init__()
+        if num_classes != 2:
+            raise ValueError("PrototypeDSTHead currently supports binary classification only.")
+        if prototypes_per_class <= 0:
+            raise ValueError("prototypes_per_class must be positive.")
+        self.feature_dim = int(feature_dim)
+        self.num_classes = int(num_classes)
+        self.prototypes_per_class = int(prototypes_per_class)
+        self.n_prototypes = self.num_classes * self.prototypes_per_class
+        self.topk = int(topk)
+        self.normalize = bool(normalize)
+        self.gamma_init = float(gamma_init)
+        self.alpha_init = float(alpha_init)
+        self.dropout = nn.Dropout(p=float(dropout))
+
+        self.ds_module = Dempster_Shafer_Module(
+            n_feature_maps=self.feature_dim,
+            n_classes=self.num_classes,
+            n_prototypes=self.n_prototypes,
         )
-        metrics = binary_metrics(y_val, pred["probability_1"], args.threshold)
-        bacc = metrics["bacc_at_threshold"]
-        auc = metrics["auc"] if np.isfinite(metrics["auc"]) else -np.inf
-        if bacc > best_bacc or (np.isclose(bacc, best_bacc) and auc > best_auc):
-            best_temperature = temp
-            best_bacc = bacc
-            best_auc = auc
-    return best_temperature, best_bacc, best_auc
+        self.ds_module.ds1_activate = DistanceActivation_layer(
+            n_prototypes=self.n_prototypes,
+            init_alpha=dst_activation_init_alpha(self.alpha_init),
+            init_gamma=dst_activation_init_gamma(self.gamma_init),
+        )
+        self.reset_parameters()
+
+    @property
+    def prototypes(self):
+        return self.ds_module.ds1.w.view(
+            self.num_classes,
+            self.prototypes_per_class,
+            self.feature_dim,
+        )
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.ds_module.ds1.w)
+
+    def initialize_prototypes(self, prototypes):
+        expected_shape = (self.num_classes, self.prototypes_per_class, self.feature_dim)
+        if tuple(prototypes.shape) != expected_shape:
+            raise ValueError(f"Expected prototype tensor shape {expected_shape}, got {tuple(prototypes.shape)}.")
+        flat_prototypes = prototypes.reshape(self.n_prototypes, self.feature_dim)
+        with torch.no_grad():
+            self.ds_module.ds1.w.copy_(
+                flat_prototypes.to(device=self.ds_module.ds1.w.device, dtype=self.ds_module.ds1.w.dtype)
+            )
+
+    def _compute_distances(self, features):
+        prototypes = self.ds_module.ds1.w
+        if self.normalize:
+            features = F.normalize(features, dim=-1)
+            prototypes = F.normalize(prototypes, dim=-1)
+        return (features[:, None, :] - prototypes[None, :, :]).pow(2).sum(dim=-1)
+
+    def _reshape_prototypes(self, tensor):
+        return tensor.view(tensor.shape[0], self.num_classes, self.prototypes_per_class)
+
+    def forward(self, features):
+        if features.dim() != 2 or features.shape[1] != self.feature_dim:
+            raise ValueError(f"Expected features [B, {self.feature_dim}], got {tuple(features.shape)}.")
+
+        features = self.dropout(features.float())
+        distances = self._compute_distances(features)
+        ed_ac = self.ds_module.ds1_activate(distances)
+        mass_prototypes = self.ds_module.ds2(ed_ac)
+        mass_prototypes_omega = self.ds_module.ds2_omega(mass_prototypes)
+        mass_dempster = self.ds_module.ds3_dempster(mass_prototypes_omega)
+        mass = self.ds_module.ds3_normalize(mass_dempster)
+        prob, uncertainty = pignistic(mass, self.num_classes)
+
+        prototype_evidence = torch.zeros(
+            features.size(0),
+            self.num_classes,
+            self.prototypes_per_class,
+            device=features.device,
+            dtype=features.dtype,
+        )
+        for class_idx in range(self.num_classes):
+            start = class_idx * self.prototypes_per_class
+            end = start + self.prototypes_per_class
+            prototype_evidence[:, class_idx, :] = mass_prototypes[:, start:end, class_idx]
+
+        distances_by_class = self._reshape_prototypes(distances)
+        similarity = self._reshape_prototypes(ed_ac)
+        out = {
+            "prob": prob,
+            "uncertainty": uncertainty,
+            "dst_mass": mass,
+            "prototype_distances": distances_by_class,
+            "prototype_similarity": similarity,
+            "prototype_evidence": prototype_evidence,
+            "prototype_mass": prototype_evidence,
+        }
+
+        if self.topk > 0:
+            topk = min(self.topk, self.prototypes_per_class)
+            top_evidence, top_idx = torch.topk(prototype_evidence, k=topk, dim=-1)
+            out.update(
+                {
+                    "topk_proto_idx": top_idx,
+                    "topk_proto_evidence": top_evidence,
+                    "topk_proto_mass": top_evidence,
+                    "topk_proto_similarity": torch.gather(similarity, dim=-1, index=top_idx),
+                    "topk_proto_distances": torch.gather(distances_by_class, dim=-1, index=top_idx),
+                }
+            )
+        return out
+
+
+class EmbeddingPrototypeDST(nn.Module):
+    def __init__(self, feature_dim, prototypes_per_class, topk, gamma_init, alpha_init, normalize, dropout):
+        super().__init__()
+        self.dst_head = PrototypeDSTHead(
+            feature_dim=feature_dim,
+            num_classes=2,
+            prototypes_per_class=prototypes_per_class,
+            topk=topk,
+            gamma_init=gamma_init,
+            alpha_init=alpha_init,
+            normalize=normalize,
+            dropout=dropout,
+        )
+
+    def initialize_prototypes(self, prototypes):
+        self.dst_head.initialize_prototypes(prototypes)
+
+    def forward(self, features):
+        return self.dst_head(features)
+
+
+class PrototypeDSTNLLLoss(nn.Module):
+    def __init__(self, class_weights=None, eps=1e-10):
+        super().__init__()
+        self.eps = float(eps)
+        if class_weights is None:
+            self.register_buffer("class_weights", None)
+        else:
+            self.register_buffer("class_weights", torch.as_tensor(class_weights, dtype=torch.float32))
+
+    def forward(self, head_output, target):
+        prob = head_output["prob"].clamp(min=self.eps, max=1.0)
+        target_indices = target.long().to(prob.device)
+        weight = None if self.class_weights is None else self.class_weights.to(device=prob.device, dtype=prob.dtype)
+        return F.nll_loss(torch.log(prob), target_indices, weight=weight)
+
+
+def compute_class_weights(y_train, args):
+    mode = args.class_weight_mode
+    info = {
+        "mode": mode,
+        "n_neg": int((y_train == 0).sum()),
+        "n_pos": int((y_train == 1).sum()),
+        "effective_beta": float(args.effective_beta),
+        "class_weights": None,
+    }
+    if mode == "none":
+        return None, info
+    if info["n_neg"] <= 0 or info["n_pos"] <= 0:
+        print("[WARN] Training split has a missing class; using unweighted DST NLL.")
+        return None, info
+    if mode == "inverse":
+        weights = np.array([1.0, info["n_neg"] / max(info["n_pos"], 1)], dtype=np.float32)
+    else:
+        beta = float(args.effective_beta)
+        if beta < 0.0 or beta >= 1.0:
+            raise ValueError("--effective-beta must be in [0, 1).")
+        if beta == 0.0:
+            weights = np.array([1.0, 1.0], dtype=np.float32)
+        else:
+            effective_neg = (1.0 - np.power(beta, info["n_neg"])) / (1.0 - beta)
+            effective_pos = (1.0 - np.power(beta, info["n_pos"])) / (1.0 - beta)
+            weights = np.array([1.0 / effective_neg, 1.0 / effective_pos], dtype=np.float32)
+            weights = weights / np.mean(weights)
+    info["class_weights"] = [float(weights[0]), float(weights[1])]
+    return torch.tensor(weights, dtype=torch.float32), info
+
+
+def _class_balanced_mean(values, labels, num_classes, balance_classes):
+    if not balance_classes:
+        return values.mean()
+
+    class_means = []
+    for class_idx in range(num_classes):
+        class_mask = labels == class_idx
+        if class_mask.any():
+            class_means.append(values[class_mask].mean())
+    if not class_means:
+        return values.mean()
+    return torch.stack(class_means).mean()
+
+
+def _prototype_diversity_loss(model, margin):
+    prototypes = model.dst_head.prototypes
+    if model.dst_head.normalize:
+        prototypes = F.normalize(prototypes, p=2, dim=-1)
+
+    per_class_losses = []
+    for class_idx in range(prototypes.shape[0]):
+        if prototypes.shape[1] < 2:
+            continue
+        pairwise_distance = torch.pdist(prototypes[class_idx], p=2)
+        per_class_losses.append(F.relu(float(margin) - pairwise_distance).pow(2).mean())
+
+    if not per_class_losses:
+        return prototypes.new_zeros(())
+    return torch.stack(per_class_losses).mean()
+
+
+def prototype_regularization_loss(model, head_output, labels, args):
+    distances = head_output["prototype_distances"].clamp_min(0.0)
+    labels = labels.long()
+    num_classes = int(distances.shape[1])
+    if torch.any((labels < 0) | (labels >= num_classes)):
+        raise ValueError(f"Prototype DST labels must be in [0, {num_classes - 1}].")
+
+    batch_indices = torch.arange(labels.shape[0], device=labels.device)
+    margin = float(args.proto_margin)
+    balance_classes = str(args.proto_balance_classes).lower() == "y"
+
+    own_distances = distances[batch_indices, labels]
+    nearest_own = own_distances.min(dim=-1).values.clamp_min(1e-12).sqrt()
+    attract_loss = _class_balanced_mean(nearest_own, labels, num_classes, balance_classes)
+
+    other_mask = F.one_hot(labels, num_classes=num_classes).bool().unsqueeze(-1)
+    other_distances = distances.masked_fill(other_mask, float("inf")).flatten(start_dim=1)
+    nearest_other = other_distances.min(dim=1).values.clamp_min(1e-12).sqrt()
+    separation_loss = _class_balanced_mean(
+        F.relu(margin - nearest_other).pow(2),
+        labels,
+        num_classes,
+        balance_classes,
+    )
+
+    diversity_loss = _prototype_diversity_loss(model, margin)
+    raw = (
+        float(args.proto_attract_weight) * attract_loss
+        + float(args.proto_separation_weight) * separation_loss
+        + float(args.proto_diversity_weight) * diversity_loss
+    )
+    total = float(args.proto_loss_weight) * raw
+    return total, {
+        "proto_loss": float(total.detach().cpu()),
+        "proto_loss_raw": float(raw.detach().cpu()),
+        "proto_attract_loss": float(attract_loss.detach().cpu()),
+        "proto_separation_loss": float(separation_loss.detach().cpu()),
+        "proto_diversity_loss": float(diversity_loss.detach().cpu()),
+    }
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, args):
+    model.train()
+    total_loss = 0.0
+    total_n = 0
+    proto_totals = {
+        "proto_loss": 0.0,
+        "proto_loss_raw": 0.0,
+        "proto_attract_loss": 0.0,
+        "proto_separation_loss": 0.0,
+        "proto_diversity_loss": 0.0,
+    }
+    for features, labels, _ in loader:
+        features = features.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        head_output = model(features)
+        task_loss = criterion(head_output, labels)
+        proto_loss, proto_stats = prototype_regularization_loss(model, head_output, labels, args)
+        loss = task_loss + proto_loss
+        loss.backward()
+        optimizer.step()
+
+        batch_size = int(labels.shape[0])
+        total_loss += float(loss.detach().cpu()) * batch_size
+        total_n += batch_size
+        for key in proto_totals:
+            proto_totals[key] += proto_stats[key] * batch_size
+    stats = {key: value / max(total_n, 1) for key, value in proto_totals.items()}
+    return total_loss / max(total_n, 1), stats
+
+
+def predict_to_frame(meta, features, labels, positions, model, criterion, args, device):
+    loader = make_loader(
+        features,
+        labels,
+        positions,
+        args.batch_size,
+        shuffle=False,
+        seed=args.seed,
+        num_workers=args.num_workers,
+    )
+    model.eval()
+    row_ids = []
+    prob_rows = []
+    mass_rows = []
+    uncertainty_rows = []
+    loss_total = 0.0
+    loss_n = 0
+
+    with torch.no_grad():
+        for batch_features, batch_labels, batch_rows in loader:
+            batch_features = batch_features.to(device, non_blocking=True)
+            batch_labels = batch_labels.to(device, non_blocking=True)
+            head_output = model(batch_features)
+            loss = criterion(head_output, batch_labels)
+            batch_size = int(batch_labels.shape[0])
+            loss_total += float(loss.detach().cpu()) * batch_size
+            loss_n += batch_size
+            row_ids.append(batch_rows.numpy())
+            prob_rows.append(head_output["prob"].detach().cpu().numpy())
+            mass_rows.append(head_output["dst_mass"].detach().cpu().numpy())
+            uncertainty_rows.append(head_output["uncertainty"].detach().cpu().numpy())
+
+    if not row_ids:
+        return meta.iloc[[]].copy(), float("nan")
+
+    row_ids = np.concatenate(row_ids).astype(int)
+    order = np.argsort(row_ids)
+    row_ids = row_ids[order]
+    probs_np = np.concatenate(prob_rows, axis=0)[order]
+    mass_np = np.concatenate(mass_rows, axis=0)[order]
+    uncertainty_np = np.concatenate(uncertainty_rows, axis=0)[order]
+
+    pred_df = meta.iloc[row_ids].copy().reset_index(drop=True)
+    pred_df["dst_mass_0"] = mass_np[:, 0]
+    pred_df["dst_mass_1"] = mass_np[:, 1]
+    pred_df["dst_mass_omega"] = mass_np[:, 2]
+    pred_df["dst_probability_0"] = probs_np[:, 0]
+    pred_df["dst_probability_1"] = probs_np[:, 1]
+    pred_df["probability_1"] = pred_df["dst_probability_1"]
+    pred_df["dst_uncertainty"] = uncertainty_np
+    pred_df = attach_prediction_columns(
+        pred_df,
+        args.label,
+        "dst_probability_1",
+        parse_group_cols(args.group_cols),
+        args.score_agg,
+        args.threshold,
+    )
+    return pred_df, loss_total / max(loss_n, 1)
+
+
+def select_eval_metric(metrics_df, eval_split, args, eval_loss):
+    if args.best_metric == "loss":
+        return -float(eval_loss), {
+            "split": eval_split,
+            "grain": "loss",
+            "auc": float("nan"),
+            "bacc_at_threshold": float("nan"),
+            "pred_pos_at_threshold": float("nan"),
+        }
+
+    group_grain = ",".join(parse_group_cols(args.group_cols))
+    split_rows = metrics_df[metrics_df["split"] == eval_split]
+    if split_rows.empty:
+        split_rows = metrics_df[metrics_df["split"] == "all"]
+    if split_rows.empty:
+        return float("-inf"), {}
+
+    group_rows = split_rows[split_rows["grain"] == group_grain]
+    metric_row = (group_rows if not group_rows.empty else split_rows).iloc[0].to_dict()
+    key = "auc" if args.best_metric == "auc" else "bacc_at_threshold"
+    value = float(metric_row.get(key, float("nan")))
+    if not np.isfinite(value):
+        value = float("-inf")
+    return value, metric_row
+
+
+def torch_load(path, map_location):
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=map_location)
+
+
+def resolve_gamma_init(args):
+    if args.temperature is None or str(args.temperature).lower() == "auto":
+        return float(args.dst_gamma_init)
+    temperature = float(args.temperature)
+    if temperature <= 0:
+        raise ValueError("--temperature must be positive or 'auto'.")
+    return 1.0 / temperature
+
+
+def validate_args(args):
+    if args.epochs <= 0:
+        raise ValueError("--epochs must be positive.")
+    if args.batch_size <= 0:
+        raise ValueError("--batch-size must be positive.")
+    if args.prototypes_per_class <= 0:
+        raise ValueError("--prototypes-per-class must be positive.")
+    if args.prototype_topk < 0:
+        raise ValueError("--prototype-topk must be non-negative.")
+    if args.patience < 0:
+        raise ValueError("--patience must be non-negative.")
+    for name in ["proto_attract_weight", "proto_separation_weight", "proto_diversity_weight", "proto_loss_weight"]:
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be non-negative.")
 
 
 def main():
     args = build_parser().parse_args()
+    validate_args(args)
+    set_seed(args.seed)
+    device = choose_device(args)
+    gamma_init = resolve_gamma_init(args)
+
     embedding_dir = resolve_path(args.embedding_dir)
     embedding_path = resolve_path(args.embeddings) if args.embeddings else embedding_dir / "embeddings.npy"
     metadata_path = resolve_path(args.metadata) if args.metadata else embedding_dir / "metadata.csv"
@@ -381,100 +890,221 @@ def main():
     if args.label not in meta.columns:
         raise ValueError(f"metadata is missing label column: {args.label}")
 
-    meta = meta.copy()
+    meta = meta.copy().reset_index(drop=True)
     meta["dst_split"] = assign_splits(meta, args)
-    label_values = meta[args.label].astype(int).values
+    original_num_rows = int(len(meta))
+    sample_positions = stratified_sample_positions(meta, args.label, "dst_split", args.max_samples, args.seed)
+    if len(sample_positions) < len(meta):
+        embeddings = embeddings[sample_positions]
+        meta = meta.iloc[sample_positions].copy().reset_index(drop=True)
 
-    x_all = np.asarray(embeddings, dtype=np.float32)
+    labels = meta[args.label].astype(int).to_numpy()
+    features = np.asarray(embeddings, dtype=np.float32)
     if not args.no_normalize:
-        x_all = normalize_features(x_all)
+        features = normalize_features(features).astype(np.float32, copy=False)
 
-    train_mask = meta["dst_split"].values == "train"
-    if train_mask.sum() == 0:
+    train_positions = np.flatnonzero(meta["dst_split"].values == "train")
+    if len(train_positions) == 0:
         raise ValueError("No training rows after split assignment.")
-    x_train = x_all[train_mask]
-    y_train = label_values[train_mask]
-    if args.max_train_samples is not None and len(x_train) > args.max_train_samples:
-        rng = np.random.default_rng(args.seed)
-        sample_idx = rng.choice(len(x_train), size=args.max_train_samples, replace=False)
-        x_train = x_train[sample_idx]
-        y_train = y_train[sample_idx]
+    train_positions = stratified_limit_positions(train_positions, labels, args.max_train_samples, args.seed)
+    y_train = labels[train_positions]
+    if len(np.unique(y_train)) < 2:
+        raise ValueError("Training split must contain both classes for Prototype-DST.")
 
-    prototypes, prototype_labels = classwise_prototypes(
-        x_train,
-        y_train,
-        args.prototypes_per_class,
-        args.seed,
-    )
-
-    if str(args.temperature).lower() == "auto":
-        val_mask = meta["dst_split"].values == "val"
-        if val_mask.sum() > 0 and len(np.unique(label_values[val_mask])) == 2:
-            temperature, val_bacc, val_auc = tune_temperature(x_all[val_mask], label_values[val_mask], prototypes, prototype_labels, args)
-            print(f"[temperature] auto selected {temperature:g} on val bACC={val_bacc:.4f}, AUC={val_auc:.4f}")
-        else:
-            temperature = 1.0
-            print("[temperature] no usable validation split; using 1.0")
+    val_positions = np.flatnonzero(meta["dst_split"].values == "val")
+    test_positions = np.flatnonzero(meta["dst_split"].values == "test")
+    if len(val_positions) > 0:
+        eval_positions = val_positions
+        eval_split = "val"
+    elif len(test_positions) > 0:
+        eval_positions = test_positions
+        eval_split = "test"
+        print("[WARN] No validation rows; early stopping will use test rows.")
     else:
-        temperature = float(args.temperature)
+        eval_positions = train_positions
+        eval_split = "train"
+        print("[WARN] No validation/test rows; early stopping will use train rows.")
 
-    pred = dst_predict(
-        x_all,
-        prototypes,
-        prototype_labels,
-        temperature,
-        args.uncertainty_strength,
-        args.batch_size,
-    )
+    feature_dim = int(features.shape[1])
+    model = EmbeddingPrototypeDST(
+        feature_dim=feature_dim,
+        prototypes_per_class=args.prototypes_per_class,
+        topk=args.prototype_topk,
+        gamma_init=gamma_init,
+        alpha_init=args.dst_alpha_init,
+        normalize=not bool(args.no_normalize),
+        dropout=args.dropout,
+    ).to(device)
 
-    pred_df = meta.copy()
-    pred_df["dst_mass_0"] = pred["mass_0"]
-    pred_df["dst_mass_1"] = pred["mass_1"]
-    pred_df["dst_uncertainty"] = pred["uncertainty"]
-    pred_df["dst_probability_1"] = pred["probability_1"]
-    pred_df = attach_prediction_columns(
-        pred_df,
-        args.label,
-        "dst_probability_1",
-        parse_group_cols(args.group_cols),
-        args.score_agg,
-        args.threshold,
-    )
+    prototype_initialized_from = "random"
+    if args.prototype_init == "kmeans":
+        prototypes = classwise_prototypes(features[train_positions], labels[train_positions], args.prototypes_per_class, args.seed)
+        model.initialize_prototypes(prototypes.to(device))
+        prototype_initialized_from = "train_embedding_kmeans"
+        print(f"Initialized DST prototypes from train embeddings: {tuple(prototypes.shape)}")
+
+    class_weights, class_weight_info = compute_class_weights(y_train, args)
+    if class_weight_info["class_weights"] is not None:
+        print(
+            "Class weights "
+            f"({class_weight_info['mode']}): neg={class_weight_info['class_weights'][0]:.6f}, "
+            f"pos={class_weight_info['class_weights'][1]:.6f}"
+        )
+
+    criterion = PrototypeDSTNLLLoss(class_weights=class_weights)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    train_loader = make_loader(features, labels, train_positions, args.batch_size, True, args.seed, args.num_workers)
+
+    best_path = output_dir / "dst_best.pt"
+    history = []
+    best_metric = float("-inf")
+    best_epoch = -1
+    epochs_no_improve = 0
+
+    print(f"[device] {device}")
+    print(f"[split counts] {meta['dst_split'].value_counts().to_dict()}")
+    print(f"[train rows] {len(train_positions)}  [eval rows] {len(eval_positions)} ({eval_split})")
+    print(f"[DST] trainable Prototype-DST head, gamma_init={gamma_init:g}, alpha_init={args.dst_alpha_init:g}")
+
+    for epoch in range(args.epochs):
+        train_loss, train_proto_stats = train_one_epoch(model, train_loader, criterion, optimizer, device, args)
+        eval_df, eval_loss = predict_to_frame(meta, features, labels, eval_positions, model, criterion, args, device)
+        eval_metrics = evaluate_predictions(eval_df, args)
+        metric_value, metric_row = select_eval_metric(eval_metrics, eval_split, args, eval_loss)
+        improved = metric_value > best_metric + 1e-8
+        if improved:
+            best_metric = metric_value
+            best_epoch = epoch
+            epochs_no_improve = 0
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "feature_dim": feature_dim,
+                    "epoch": epoch,
+                    "best_metric": best_metric,
+                    "best_metric_name": args.best_metric,
+                    "eval_split": eval_split,
+                    "args": vars(args),
+                    "gamma_init": gamma_init,
+                    "class_weight_info": class_weight_info,
+                    "prototype_initialized_from": prototype_initialized_from,
+                    "history": history,
+                },
+                best_path,
+            )
+        else:
+            epochs_no_improve += 1
+
+        history_row = {
+            "epoch": epoch + 1,
+            "train_loss": float(train_loss),
+            "eval_split": eval_split,
+            "eval_loss": float(eval_loss),
+            "best_metric_name": args.best_metric,
+            "eval_metric": float(metric_value),
+            "best_metric": float(best_metric),
+            "improved": bool(improved),
+        }
+        history_row.update(train_proto_stats)
+        for key in ("grain", "auc", "bacc_at_threshold", "sensitivity_at_threshold", "specificity_at_threshold", "pred_pos_at_threshold"):
+            if key in metric_row:
+                history_row[f"eval_{key}"] = metric_row[key]
+        history.append(history_row)
+
+        auc_text = metric_row.get("auc", float("nan")) if metric_row else float("nan")
+        bacc_text = metric_row.get("bacc_at_threshold", float("nan")) if metric_row else float("nan")
+        pred_pos_text = metric_row.get("pred_pos_at_threshold", float("nan")) if metric_row else float("nan")
+        print(
+            f"Epoch {epoch + 1}/{args.epochs} "
+            f"train_loss={train_loss:.4f} {eval_split}_loss={eval_loss:.4f} "
+            f"AUC={auc_text:.4f} bACC@{args.threshold:g}={bacc_text:.4f} "
+            f"Pred_Pos@{args.threshold:g}={pred_pos_text} "
+            f"proto={train_proto_stats['proto_loss']:.4f} "
+            f"best_{args.best_metric}={best_metric:.4f}"
+        )
+
+        if args.patience > 0 and epochs_no_improve >= args.patience:
+            print(f"Early stopping after {epoch + 1} epochs (patience={args.patience}).")
+            break
+
+    if best_epoch < 0:
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "feature_dim": feature_dim,
+                "epoch": args.epochs - 1,
+                "best_metric": best_metric,
+                "best_metric_name": args.best_metric,
+                "eval_split": eval_split,
+                "args": vars(args),
+                "gamma_init": gamma_init,
+                "class_weight_info": class_weight_info,
+                "prototype_initialized_from": prototype_initialized_from,
+                "history": history,
+            },
+            best_path,
+        )
+    checkpoint = torch_load(best_path, map_location=device)
+    model.load_state_dict(checkpoint["model"])
+
+    all_positions = np.arange(len(meta), dtype=int)
+    pred_df, _ = predict_to_frame(meta, features, labels, all_positions, model, criterion, args, device)
+    metrics_df = evaluate_predictions(pred_df, args)
 
     pred_path = output_dir / "dst_all_predictions.csv"
     metrics_path = output_dir / "dst_metrics.csv"
-    prototypes_path = output_dir / "dst_prototypes.npz"
     manifest_path = output_dir / "dst_manifest.json"
-
     pred_df.to_csv(pred_path, index=False)
-    metrics_df = evaluate_predictions(pred_df, args)
     metrics_df.to_csv(metrics_path, index=False)
-    np.savez_compressed(prototypes_path, prototypes=prototypes, prototype_labels=prototype_labels)
 
+    split_counts = {str(k): int(v) for k, v in meta["dst_split"].value_counts().to_dict().items()}
+    label_counts = {str(k): int(v) for k, v in pd.Series(labels).value_counts().to_dict().items()}
     manifest = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "embedding_path": str(embedding_path),
         "metadata_path": str(metadata_path),
         "output_dir": str(output_dir),
         "label": args.label,
+        "original_num_rows": original_num_rows,
         "num_rows": int(len(meta)),
-        "feature_dim": int(embeddings.shape[1]),
-        "split_counts": meta["dst_split"].value_counts().to_dict(),
+        "feature_dim": feature_dim,
+        "device": args.device,
+        "gpu_id": args.gpu_id,
+        "effective_device": str(device),
+        "split_counts": split_counts,
+        "label_counts": label_counts,
         "prototypes_per_class": int(args.prototypes_per_class),
-        "temperature": float(temperature),
-        "uncertainty_strength": float(args.uncertainty_strength),
+        "prototype_topk": int(args.prototype_topk),
+        "prototype_init": args.prototype_init,
+        "prototype_initialized_from": prototype_initialized_from,
+        "dst_gamma_init": float(gamma_init),
+        "dst_alpha_init": float(args.dst_alpha_init),
+        "class_weight_info": class_weight_info,
+        "proto_attract_weight": float(args.proto_attract_weight),
+        "proto_separation_weight": float(args.proto_separation_weight),
+        "proto_diversity_weight": float(args.proto_diversity_weight),
+        "proto_loss_weight": float(args.proto_loss_weight),
+        "proto_margin": float(args.proto_margin),
+        "proto_balance_classes": args.proto_balance_classes,
         "threshold": float(args.threshold),
         "normalize": not bool(args.no_normalize),
         "group_cols": parse_group_cols(args.group_cols),
         "score_agg": args.score_agg,
-        "val_fold": int(args.val_fold),
+        "best_metric_name": args.best_metric,
+        "best_metric_value": float(checkpoint.get("best_metric", best_metric)),
+        "best_epoch": int(checkpoint.get("epoch", best_epoch)) + 1,
+        "eval_split": eval_split,
+        "history": history,
+        "prediction_file": str(pred_path),
+        "metrics_file": str(metrics_path),
+        "checkpoint_file": str(best_path),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print("\nDone.")
     print(f"  predictions: {pred_path}")
     print(f"  metrics:     {metrics_path}")
-    print(f"  prototypes:  {prototypes_path}")
+    print(f"  checkpoint:  {best_path}")
     print(f"  manifest:    {manifest_path}")
     if not metrics_df.empty:
         print(metrics_df.to_string(index=False))

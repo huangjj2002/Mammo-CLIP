@@ -23,6 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -43,39 +44,56 @@ def build_parser():
     parser.add_argument("--metadata", default=None, help="Path to metadata.csv. Overrides --embedding-dir.")
     parser.add_argument("--output-dir", default="embedding_edl_results/origin_finetuned_proto_edl")
     parser.add_argument("--label", default="cancer")
-    parser.add_argument("--prototypes-per-class", type=int, default=10)
-    parser.add_argument("--prototype-temperature", type=float, default=1.0)
-    parser.add_argument("--prototype-init", choices=["kmeans", "random"], default="kmeans")
+    parser.add_argument("--prototypes-per-class", "--prototypes_per_class", type=int, default=10)
+    parser.add_argument("--prototype-temperature", "--prototype_temperature", type=float, default=1.0)
+    parser.add_argument("--prototype-init", "--prototype_init", choices=["kmeans", "random"], default="kmeans")
     parser.add_argument("--no-normalize", action="store_true", help="Disable L2 normalization before training.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--batch-size", type=int, default=512)
-    parser.add_argument("--patience", type=int, default=10)
-    parser.add_argument("--edl-loss-type", choices=["digamma", "log", "mse"], default="digamma")
-    parser.add_argument("--kl-weight", type=float, default=0.1)
-    parser.add_argument("--annealing-start", type=int, default=0)
-    parser.add_argument("--annealing-epochs", type=int, default=10)
-    parser.add_argument("--class-weight-mode", choices=["none", "inverse", "effective"], default="inverse")
-    parser.add_argument("--effective-beta", type=float, default=0.9999)
+    parser.add_argument("--weight-decay", "--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--batch-size", "--batch_size", type=int, default=512)
+    parser.add_argument(
+        "--patience",
+        "--early-stopping-patience",
+        "--early_stopping_patience",
+        type=int,
+        default=10,
+    )
+    parser.add_argument("--edl-loss-type", "--edl_loss_type", choices=["digamma", "log", "mse"], default="digamma")
+    parser.add_argument("--kl-weight", "--kl_weight", type=float, default=0.1)
+    parser.add_argument("--annealing-start", "--annealing_start", type=int, default=0)
+    parser.add_argument("--annealing-epochs", "--annealing_epochs", type=int, default=10)
+    parser.add_argument(
+        "--class-weight-mode",
+        "--class_weight_mode",
+        choices=["none", "inverse", "effective"],
+        default="inverse",
+    )
+    parser.add_argument("--effective-beta", "--effective_beta", type=float, default=0.9999)
+    parser.add_argument("--proto-attract-weight", "--proto_attract_weight", type=float, default=0.0)
+    parser.add_argument("--proto-separation-weight", "--proto_separation_weight", type=float, default=0.0)
+    parser.add_argument("--proto-diversity-weight", "--proto_diversity_weight", type=float, default=0.0)
+    parser.add_argument("--proto-loss-weight", "--proto_loss_weight", type=float, default=1.0)
+    parser.add_argument("--proto-margin", "--proto_margin", type=float, default=1.0)
+    parser.add_argument("--proto-balance-classes", "--proto_balance_classes", choices=["y", "n"], default="y")
     parser.add_argument("--threshold", type=float, default=0.5)
-    parser.add_argument("--best-metric", choices=["bacc", "auc", "loss"], default="bacc")
-    parser.add_argument("--split-mode", choices=["auto", "metadata", "cohort", "fold"], default="auto")
-    parser.add_argument("--split-col", default="split")
-    parser.add_argument("--fold-col", default="fold")
-    parser.add_argument("--val-fold", type=int, default=0)
-    parser.add_argument("--cohort-col", default="cohort_num")
-    parser.add_argument("--train-cohorts", default="1-8")
-    parser.add_argument("--test-cohorts", default="9-10")
-    parser.add_argument("--holdout-val-percent", type=float, default=20.0)
-    parser.add_argument("--group-cols", default="patient_id")
-    parser.add_argument("--score-agg", choices=["mean", "max"], default="mean")
-    parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--max-train-samples", type=int, default=None)
+    parser.add_argument("--best-metric", "--best_metric", choices=["bacc", "auc", "loss"], default="bacc")
+    parser.add_argument("--split-mode", "--split_mode", choices=["auto", "metadata", "cohort", "fold"], default="auto")
+    parser.add_argument("--split-col", "--split_col", default="split")
+    parser.add_argument("--fold-col", "--fold_col", default="fold")
+    parser.add_argument("--val-fold", "--val_fold", type=int, default=0)
+    parser.add_argument("--cohort-col", "--cohort_col", default="cohort_num")
+    parser.add_argument("--train-cohorts", "--train_cohorts", default="1-8")
+    parser.add_argument("--test-cohorts", "--test_cohorts", default="9-10")
+    parser.add_argument("--holdout-val-percent", "--holdout_val_percent", type=float, default=20.0)
+    parser.add_argument("--group-cols", "--group_cols", default="patient_id")
+    parser.add_argument("--score-agg", "--score_agg", choices=["mean", "max"], default="mean")
+    parser.add_argument("--max-samples", "--max_samples", type=int, default=None)
+    parser.add_argument("--max-train-samples", "--max_train_samples", type=int, default=None)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto")
-    parser.add_argument("--gpu-id", type=int, default=None)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--gpu-id", "--gpu_id", type=int, default=None)
+    parser.add_argument("--num-workers", "--num_workers", type=int, default=0)
     return parser
 
 
@@ -482,23 +500,107 @@ def compute_class_weights(y_train, args):
     return torch.tensor(weights, dtype=torch.float32), info
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, epoch):
+def _class_balanced_mean(values, labels, num_classes, balance_classes):
+    if not balance_classes:
+        return values.mean()
+
+    class_means = []
+    for class_idx in range(num_classes):
+        class_mask = labels == class_idx
+        if class_mask.any():
+            class_means.append(values[class_mask].mean())
+    if not class_means:
+        return values.mean()
+    return torch.stack(class_means).mean()
+
+
+def _prototype_diversity_loss(model, margin):
+    prototypes = model.prototype_head.prototypes
+    if model.prototype_head.normalize:
+        prototypes = F.normalize(prototypes, p=2, dim=-1)
+
+    per_class_losses = []
+    for class_idx in range(prototypes.shape[0]):
+        if prototypes.shape[1] < 2:
+            continue
+        pairwise_distance = torch.pdist(prototypes[class_idx], p=2)
+        per_class_losses.append(F.relu(float(margin) - pairwise_distance).pow(2).mean())
+
+    if not per_class_losses:
+        return prototypes.new_zeros(())
+    return torch.stack(per_class_losses).mean()
+
+
+def prototype_regularization_loss(model, details, labels, args):
+    distances = details["prototype_distance"].clamp_min(0.0)
+    labels = labels.long()
+    num_classes = int(distances.shape[1])
+    if torch.any((labels < 0) | (labels >= num_classes)):
+        raise ValueError(f"Prototype EDL labels must be in [0, {num_classes - 1}].")
+
+    batch_indices = torch.arange(labels.shape[0], device=labels.device)
+    margin = float(args.proto_margin)
+    balance_classes = str(args.proto_balance_classes).lower() == "y"
+
+    own_distances = distances[batch_indices, labels]
+    nearest_own = own_distances.min(dim=-1).values.clamp_min(1e-12).sqrt()
+    attract_loss = _class_balanced_mean(nearest_own, labels, num_classes, balance_classes)
+
+    other_mask = F.one_hot(labels, num_classes=num_classes).bool().unsqueeze(-1)
+    other_distances = distances.masked_fill(other_mask, float("inf")).flatten(start_dim=1)
+    nearest_other = other_distances.min(dim=1).values.clamp_min(1e-12).sqrt()
+    separation_loss = _class_balanced_mean(
+        F.relu(margin - nearest_other).pow(2),
+        labels,
+        num_classes,
+        balance_classes,
+    )
+
+    diversity_loss = _prototype_diversity_loss(model, margin)
+    raw = (
+        float(args.proto_attract_weight) * attract_loss
+        + float(args.proto_separation_weight) * separation_loss
+        + float(args.proto_diversity_weight) * diversity_loss
+    )
+    total = float(args.proto_loss_weight) * raw
+    return total, {
+        "proto_loss": float(total.detach().cpu()),
+        "proto_loss_raw": float(raw.detach().cpu()),
+        "proto_attract_loss": float(attract_loss.detach().cpu()),
+        "proto_separation_loss": float(separation_loss.detach().cpu()),
+        "proto_diversity_loss": float(diversity_loss.detach().cpu()),
+    }
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, epoch, args):
     model.train()
     criterion.current_epoch = epoch
     total_loss = 0.0
     total_n = 0
+    proto_totals = {
+        "proto_loss": 0.0,
+        "proto_loss_raw": 0.0,
+        "proto_attract_loss": 0.0,
+        "proto_separation_loss": 0.0,
+        "proto_diversity_loss": 0.0,
+    }
     for features, labels, _ in loader:
         features = features.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        evidence = model(features)
-        loss = criterion(evidence, labels)
+        evidence, details = model(features, return_details=True)
+        task_loss = criterion(evidence, labels)
+        proto_loss, proto_stats = prototype_regularization_loss(model, details, labels, args)
+        loss = task_loss + proto_loss
         loss.backward()
         optimizer.step()
         batch_size = int(labels.shape[0])
         total_loss += float(loss.detach().cpu()) * batch_size
         total_n += batch_size
-    return total_loss / max(total_n, 1)
+        for key in proto_totals:
+            proto_totals[key] += proto_stats[key] * batch_size
+    stats = {key: value / max(total_n, 1) for key, value in proto_totals.items()}
+    return total_loss / max(total_n, 1), stats
 
 
 def predict_to_frame(meta, features, labels, positions, model, criterion, args, device, epoch):
@@ -611,6 +713,9 @@ def main():
         raise ValueError("--prototype-temperature must be positive.")
     if args.patience < 0:
         raise ValueError("--patience must be non-negative.")
+    for name in ["proto_attract_weight", "proto_separation_weight", "proto_diversity_weight", "proto_loss_weight"]:
+        if getattr(args, name) < 0:
+            raise ValueError(f"--{name.replace('_', '-')} must be non-negative.")
 
     set_seed(args.seed)
     device = choose_device(args)
@@ -727,7 +832,7 @@ def main():
     print(f"[train rows] {len(train_positions)}  [eval rows] {len(eval_positions)} ({eval_split})")
 
     for epoch in range(args.epochs):
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch)
+        train_loss, train_proto_stats = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, args)
         eval_df, eval_loss = predict_to_frame(
             meta,
             features,
@@ -774,6 +879,7 @@ def main():
             "best_metric": float(best_metric),
             "improved": bool(improved),
         }
+        history_row.update(train_proto_stats)
         for key in ("grain", "auc", "bacc_at_threshold", "sensitivity_at_threshold", "specificity_at_threshold", "pred_pos_at_threshold"):
             if key in metric_row:
                 history_row[f"eval_{key}"] = metric_row[key]
@@ -787,6 +893,7 @@ def main():
             f"train_loss={train_loss:.4f} {eval_split}_loss={eval_loss:.4f} "
             f"AUC={auc_text:.4f} bACC@{args.threshold:g}={bacc_text:.4f} "
             f"Pred_Pos@{args.threshold:g}={pred_pos_text} "
+            f"proto={train_proto_stats['proto_loss']:.4f} "
             f"best_{args.best_metric}={best_metric:.4f}"
         )
 
@@ -844,6 +951,9 @@ def main():
         "original_num_rows": original_num_rows,
         "num_rows": int(len(meta)),
         "feature_dim": feature_dim,
+        "device": args.device,
+        "gpu_id": args.gpu_id,
+        "effective_device": str(device),
         "split_counts": split_counts,
         "label_counts": label_counts,
         "prototypes_per_class": int(args.prototypes_per_class),
@@ -853,6 +963,12 @@ def main():
         "edl_loss_type": args.edl_loss_type,
         "kl_weight": float(args.kl_weight),
         "class_weight_info": class_weight_info,
+        "proto_attract_weight": float(args.proto_attract_weight),
+        "proto_separation_weight": float(args.proto_separation_weight),
+        "proto_diversity_weight": float(args.proto_diversity_weight),
+        "proto_loss_weight": float(args.proto_loss_weight),
+        "proto_margin": float(args.proto_margin),
+        "proto_balance_classes": args.proto_balance_classes,
         "threshold": float(args.threshold),
         "normalize": not bool(args.no_normalize),
         "group_cols": parse_group_cols(args.group_cols),
