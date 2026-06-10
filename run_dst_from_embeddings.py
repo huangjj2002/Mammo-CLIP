@@ -259,6 +259,9 @@ def assign_cv_splits(meta, args):
 
     split = pd.Series("train", index=meta.index, dtype="object")
     test_mask = infer_test_mask(meta, args)
+    test_groups = meta.loc[test_mask, args.cv_group_col].drop_duplicates()
+    if len(test_groups) > 0:
+        test_mask = meta[args.cv_group_col].isin(test_groups)
     split.loc[test_mask] = "test"
     train_val_mask = ~test_mask
 
