@@ -8,6 +8,8 @@ Input bundle:
 Outputs:
   - proto_edl_all_predictions.csv
   - proto_edl_metrics.csv
+  - proto_edl_training_history.csv
+  - proto_edl_loss_curve.png
   - proto_edl_best.pt
   - proto_edl_manifest.json
 """
@@ -42,6 +44,65 @@ if str(CODEBASE_DIR) not in sys.path:
 
 from edl_loss import EDLLoss
 from edl_proto_model import PrototypeEDLHead
+
+
+def save_training_history(history, output_dir, prefix):
+    history_df = pd.DataFrame(history)
+    history_path = output_dir / f"{prefix}_training_history.csv"
+    history_df.to_csv(history_path, index=False)
+
+    loss_curve_path = output_dir / f"{prefix}_loss_curve.png"
+    saved_curve_path = None
+    if not history_df.empty:
+        try:
+            import matplotlib
+
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+
+            x_values = (
+                pd.to_numeric(history_df["epoch"], errors="coerce")
+                if "epoch" in history_df.columns
+                else np.arange(1, len(history_df) + 1)
+            )
+            fig, ax_loss = plt.subplots(figsize=(8, 5))
+            for col in ["train_loss", "eval_loss", "proto_loss"]:
+                if col not in history_df.columns:
+                    continue
+                values = pd.to_numeric(history_df[col], errors="coerce")
+                if values.notna().any():
+                    ax_loss.plot(x_values, values, marker="o", linewidth=1.5, label=col)
+
+            ax_loss.set_xlabel("epoch")
+            ax_loss.set_ylabel("loss")
+            ax_loss.grid(True, alpha=0.3)
+            if ax_loss.get_legend_handles_labels()[0]:
+                ax_loss.legend(loc="upper right")
+
+            metric_cols = ["eval_auc", "eval_bacc_at_threshold", "best_metric"]
+            metric_plotted = False
+            ax_metric = ax_loss.twinx()
+            for col in metric_cols:
+                if col not in history_df.columns:
+                    continue
+                values = pd.to_numeric(history_df[col], errors="coerce")
+                if values.notna().any():
+                    ax_metric.plot(x_values, values, linestyle="--", linewidth=1.2, label=col)
+                    metric_plotted = True
+            if metric_plotted:
+                ax_metric.set_ylabel("metric")
+                ax_metric.legend(loc="lower right")
+            else:
+                ax_metric.remove()
+
+            fig.tight_layout()
+            fig.savefig(loss_curve_path, dpi=150)
+            plt.close(fig)
+            saved_curve_path = loss_curve_path
+        except Exception as exc:
+            print(f"[WARN] Could not save loss curve PNG: {exc}")
+
+    return history_path, saved_curve_path
 
 
 def build_parser():
@@ -1080,6 +1141,7 @@ def run_single(args):
     manifest_path = output_dir / "proto_edl_manifest.json"
     pred_df.to_csv(pred_path, index=False)
     metrics_df.to_csv(metrics_path, index=False)
+    history_path, loss_curve_path = save_training_history(history, output_dir, "proto_edl")
 
     split_counts = {str(k): int(v) for k, v in meta["proto_edl_split"].value_counts().to_dict().items()}
     label_counts = {str(k): int(v) for k, v in pd.Series(labels).value_counts().to_dict().items()}
@@ -1128,6 +1190,8 @@ def run_single(args):
         "history": history,
         "prediction_file": str(pred_path),
         "metrics_file": str(metrics_path),
+        "history_file": str(history_path),
+        "loss_curve_file": str(loss_curve_path) if loss_curve_path is not None else None,
         "checkpoint_file": str(best_path),
     }
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1135,6 +1199,9 @@ def run_single(args):
     print("\nDone.")
     print(f"  predictions: {pred_path}")
     print(f"  metrics:     {metrics_path}")
+    print(f"  history:     {history_path}")
+    if loss_curve_path is not None:
+        print(f"  loss curve:  {loss_curve_path}")
     print(f"  checkpoint:  {best_path}")
     print(f"  manifest:    {manifest_path}")
     if not metrics_df.empty:

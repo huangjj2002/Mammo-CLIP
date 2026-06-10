@@ -17,6 +17,7 @@ CSV_PATH = r"/home/dhao4/workspace/hjj_workspace/data/data.csv"
 DATA_DIR = r"/home/dhao4/workspace/hjj_workspace/data"
 IMG_DIR = "images_png"
 CLIP_CHK_PT_PATH = "./model/b5-model-best-epoch-7.tar"
+WARM_START_CHECKPOINT = None
 MODEL_SAVE_DIR = "checkpoints"
 CSV_SAVE_DIR = "output_data"
 TENSORBOARD_DIR = "logs"
@@ -77,6 +78,11 @@ def build_parser():
     parser.add_argument("--data-dir", default=DATA_DIR, help="Directory containing images.")
     parser.add_argument("--img-dir", default=IMG_DIR, help="Image directory relative to data-dir.")
     parser.add_argument("--clip-chk-pt-path", default=CLIP_CHK_PT_PATH, help="Path to Mammo-CLIP checkpoint.")
+    parser.add_argument(
+        "--warm-start-checkpoint",
+        default=WARM_START_CHECKPOINT,
+        help="Optional fine-tuned downstream classifier checkpoint used to initialize the full origin model.",
+    )
     parser.add_argument("--label", default=LABEL, help="Target label column.")
     parser.add_argument("--arch", default=ARCH, help="Classifier architecture.")
     parser.add_argument("--n-folds", type=int, default=N_FOLDS, help="Number of folds. Use 0 to disable CV.")
@@ -147,6 +153,11 @@ def main():
     clip_chk_pt_path = cli_args.clip_chk_pt_path
     if not os.path.isabs(clip_chk_pt_path):
         clip_chk_pt_path = os.path.abspath(clip_chk_pt_path)
+
+    warm_start_checkpoint = cli_args.warm_start_checkpoint
+    if warm_start_checkpoint:
+        if not os.path.isabs(warm_start_checkpoint):
+            warm_start_checkpoint = os.path.abspath(warm_start_checkpoint)
 
     folds_csv_path = cli_args.folds_csv_path or os.path.join(project_root, "train_with_test_folds.csv")
     if not os.path.isabs(folds_csv_path):
@@ -223,6 +234,8 @@ def main():
         "--device", cli_args.device,
         "--apex", cli_args.apex,
     ]
+    if warm_start_checkpoint:
+        train_cmd.extend(["--warm-start-checkpoint", warm_start_checkpoint])
     train_cmd.extend(["--run-id", cli_args.run_id])
     print(f"run_id: {cli_args.run_id}")
     print(f"Running: {' '.join(train_cmd)}")

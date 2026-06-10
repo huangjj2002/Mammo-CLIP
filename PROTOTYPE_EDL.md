@@ -86,14 +86,14 @@ proto_c1_top1_similarity
 
 ## 和 DST 输出的对应关系
 
-| DST 输出 | Prototype + EDL 对应设计 |
-| --- | --- |
-| `BetP` | `prob`，CSV 中主要是 `prediction_score = prob[:, 1]` |
-| `abstain` | 不直接输出 hard abstain；用 `uncertainty` 作为 abstain score，后续可按阈值派生 |
-| `mass bar` | 改为 evidence / alpha / uncertainty bar |
-| `top-k protos` | 保留为 `proto_c*_top*_idx/evidence/similarity` |
-| `protos` | 可学习参数 `P: [2, K, D]` |
-| `patch map` | 当前 v1 先做 bag-level prototype 解释；patch-level map 后续可用 patch embedding 到 prototype 的 similarity 派生 |
+| DST 输出       | Prototype + EDL 对应设计                                                                                        |
+| -------------- | --------------------------------------------------------------------------------------------------------------- |
+| `BetP`         | `prob`，CSV 中主要是 `prediction_score = prob[:, 1]`                                                            |
+| `abstain`      | 不直接输出 hard abstain；用 `uncertainty` 作为 abstain score，后续可按阈值派生                                  |
+| `mass bar`     | 改为 evidence / alpha / uncertainty bar                                                                         |
+| `top-k protos` | 保留为 `proto_c*_top*_idx/evidence/similarity`                                                                  |
+| `protos`       | 可学习参数 `P: [2, K, D]`                                                                                       |
+| `patch map`    | 当前 v1 先做 bag-level prototype 解释；patch-level map 后续可用 patch embedding 到 prototype 的 similarity 派生 |
 
 ## 初始化方式
 
@@ -212,3 +212,4 @@ edl_proto_test_results/{dataset}_edl_proto_all_predictions.csv
 6. 如需解释，额外导出每类 top-k prototype 的 index、evidence 和 similarity。
 
 注意：不要在 prototype 初始化时使用验证集或测试集 embedding，否则会造成数据泄露。
+duhao@10086

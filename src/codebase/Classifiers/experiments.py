@@ -102,6 +102,128 @@ def _best_model_path(args):
     return args.chk_pt_path / model_name
 
 
+def _checkpoint_state_dict(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("model", "state_dict"):
+            if key in checkpoint and isinstance(checkpoint[key], dict):
+                return checkpoint[key]
+        return checkpoint
+    raise TypeError(f"Unsupported warm-start checkpoint type: {type(checkpoint)!r}")
+
+
+def _strip_module_prefix_from_state_dict(state_dict):
+    stripped = {}
+    for key, value in state_dict.items():
+        key = str(key)
+        if key.startswith("module."):
+            key = key[len("module.") :]
+        stripped[key] = value
+    return stripped
+
+
+def _shape_of(value):
+    return tuple(value.shape) if hasattr(value, "shape") else None
+
+
+def _load_warm_start_checkpoint(model, args):
+    warm_start_checkpoint = getattr(args, "warm_start_checkpoint", None)
+    if not warm_start_checkpoint:
+        print("[warm-start] not provided; training from Mammo-CLIP base checkpoint")
+        return
+
+    checkpoint_path = Path(warm_start_checkpoint).expanduser()
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Warm-start checkpoint not found: {checkpoint_path}")
+
+    print(f"[warm-start] loading classifier checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = _strip_module_prefix_from_state_dict(_checkpoint_state_dict(checkpoint))
+
+    if not any(key.startswith("image_encoder.") for key in state_dict):
+        raise ValueError(
+            f"Warm-start checkpoint has no image_encoder.* weights: {checkpoint_path}. "
+            "Refusing to continue without fine-tuned encoder weights."
+        )
+
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"[warm-start] loaded full model strictly from {checkpoint_path}")
+        return
+    except RuntimeError as exc:
+        strict_error = exc
+
+    target_state = model.state_dict()
+    compatible_state = {}
+    missing_keys = [key for key in target_state if key not in state_dict]
+    unexpected_keys = [key for key in state_dict if key not in target_state]
+    shape_mismatches = []
+
+    for key, value in state_dict.items():
+        if key not in target_state:
+            continue
+        if _shape_of(value) != _shape_of(target_state[key]):
+            shape_mismatches.append((key, _shape_of(value), _shape_of(target_state[key])))
+            continue
+        compatible_state[key] = value
+
+    non_classifier_mismatches = [
+        (key, source_shape, target_shape)
+        for key, source_shape, target_shape in shape_mismatches
+        if not key.startswith("classifier.")
+    ]
+    non_classifier_missing = [key for key in missing_keys if not key.startswith("classifier.")]
+    non_classifier_unexpected = [key for key in unexpected_keys if not key.startswith("classifier.")]
+
+    if non_classifier_mismatches or non_classifier_missing or non_classifier_unexpected:
+        details = []
+        if non_classifier_mismatches:
+            details.append(f"shape mismatches: {non_classifier_mismatches[:5]}")
+        if non_classifier_missing:
+            details.append(f"missing keys: {non_classifier_missing[:5]}")
+        if non_classifier_unexpected:
+            details.append(f"unexpected keys: {non_classifier_unexpected[:5]}")
+        raise RuntimeError(
+            "Warm-start checkpoint is incompatible outside classifier head; refusing to continue. "
+            + "; ".join(details)
+        ) from strict_error
+
+    if not any(key.startswith("image_encoder.") for key in compatible_state):
+        raise ValueError(
+            f"Warm-start checkpoint has no compatible image_encoder.* weights: {checkpoint_path}"
+        ) from strict_error
+
+    incompatible = model.load_state_dict(compatible_state, strict=False)
+    non_classifier_after_missing = [
+        key for key in incompatible.missing_keys if not key.startswith("classifier.")
+    ]
+    non_classifier_after_unexpected = [
+        key for key in incompatible.unexpected_keys if not key.startswith("classifier.")
+    ]
+    if non_classifier_after_missing or non_classifier_after_unexpected:
+        raise RuntimeError(
+            "Warm-start partial load left non-classifier incompatibilities: "
+            f"missing={non_classifier_after_missing[:5]}, "
+            f"unexpected={non_classifier_after_unexpected[:5]}"
+        ) from strict_error
+
+    skipped_classifier_keys = sorted(
+        {
+            key
+            for key, _, _ in shape_mismatches
+            if key.startswith("classifier.")
+        }
+        | {key for key in missing_keys if key.startswith("classifier.")}
+        | {key for key in unexpected_keys if key.startswith("classifier.")}
+    )
+    loaded_encoder_keys = sum(1 for key in compatible_state if key.startswith("image_encoder."))
+    print(
+        "[warm-start WARNING] classifier head is incompatible with the current task; "
+        "loaded compatible encoder weights and left classifier head newly initialized."
+    )
+    print(f"[warm-start] loaded image_encoder keys: {loaded_encoder_keys}")
+    print(f"[warm-start] skipped classifier keys: {skipped_classifier_keys[:10]}")
+
+
 def _metrics_csv_path(args):
     return args.output_path / f"fold{args.cur_fold}_metrics.csv"
 
@@ -394,6 +516,7 @@ def train_loop(args, device):
         print(args.image_encoder_type)
         model = BreastClipClassifier(args, ckpt=ckpt, n_class=n_class)
         print("Model is loaded")
+        _load_warm_start_checkpoint(model, args)
         optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
         if args.warmup_epochs == 0.1:
             warmup_steps = args.epochs
