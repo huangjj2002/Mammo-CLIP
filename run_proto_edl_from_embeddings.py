@@ -46,7 +46,14 @@ from edl_loss import EDLLoss
 from edl_proto_model import PrototypeEDLHead
 
 
-def save_training_history(history, output_dir, prefix):
+def build_loss_curve_title(model_name, args):
+    title = f"{model_name} k={int(args.prototypes_per_class)}"
+    if getattr(args, "_cv_mode", False):
+        title += f" - fold {int(args.val_fold)}"
+    return title
+
+
+def save_training_history(history, output_dir, prefix, args, model_name):
     history_df = pd.DataFrame(history)
     history_path = output_dir / f"{prefix}_training_history.csv"
     history_df.to_csv(history_path, index=False)
@@ -65,38 +72,26 @@ def save_training_history(history, output_dir, prefix):
                 if "epoch" in history_df.columns
                 else np.arange(1, len(history_df) + 1)
             )
-            fig, ax_loss = plt.subplots(figsize=(8, 5))
-            for col in ["train_loss", "eval_loss", "proto_loss"]:
-                if col not in history_df.columns:
-                    continue
-                values = pd.to_numeric(history_df[col], errors="coerce")
-                if values.notna().any():
-                    ax_loss.plot(x_values, values, marker="o", linewidth=1.5, label=col)
+            fig, ax_loss = plt.subplots(figsize=(13.66, 7.68))
+            train_values = pd.to_numeric(history_df["train_loss"], errors="coerce")
+            eval_values = pd.to_numeric(history_df["eval_loss"], errors="coerce")
+            eval_label = "val loss"
+            if "eval_split" in history_df.columns and history_df["eval_split"].notna().any():
+                eval_split = str(history_df["eval_split"].dropna().iloc[0])
+                eval_label = f"{eval_split} loss"
 
-            ax_loss.set_xlabel("epoch")
-            ax_loss.set_ylabel("loss")
+            ax_loss.plot(x_values, train_values, color="#1f77b4", linewidth=2.5, label="train loss")
+            ax_loss.plot(x_values, eval_values, color="#d62728", linewidth=2.5, label=eval_label)
+
+            ax_loss.set_xlabel("epoch", fontsize=14)
+            ax_loss.set_ylabel("loss", fontsize=14)
+            ax_loss.set_title(build_loss_curve_title(model_name, args), fontsize=18, pad=10)
+            ax_loss.tick_params(axis="both", labelsize=13)
             ax_loss.grid(True, alpha=0.3)
-            if ax_loss.get_legend_handles_labels()[0]:
-                ax_loss.legend(loc="upper right")
-
-            metric_cols = ["eval_auc", "eval_bacc_at_threshold", "best_metric"]
-            metric_plotted = False
-            ax_metric = ax_loss.twinx()
-            for col in metric_cols:
-                if col not in history_df.columns:
-                    continue
-                values = pd.to_numeric(history_df[col], errors="coerce")
-                if values.notna().any():
-                    ax_metric.plot(x_values, values, linestyle="--", linewidth=1.2, label=col)
-                    metric_plotted = True
-            if metric_plotted:
-                ax_metric.set_ylabel("metric")
-                ax_metric.legend(loc="lower right")
-            else:
-                ax_metric.remove()
+            ax_loss.legend(loc="upper right", fontsize=14)
 
             fig.tight_layout()
-            fig.savefig(loss_curve_path, dpi=150)
+            fig.savefig(loss_curve_path, dpi=100)
             plt.close(fig)
             saved_curve_path = loss_curve_path
         except Exception as exc:
@@ -769,7 +764,8 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, args):
     criterion.current_epoch = epoch
     total_loss = 0.0
     total_n = 0
-    proto_totals = {
+    loss_totals = {
+        "task_loss": 0.0,
         "proto_loss": 0.0,
         "proto_loss_raw": 0.0,
         "proto_attract_loss": 0.0,
@@ -789,13 +785,14 @@ def train_one_epoch(model, loader, criterion, optimizer, device, epoch, args):
         batch_size = int(labels.shape[0])
         total_loss += float(loss.detach().cpu()) * batch_size
         total_n += batch_size
-        for key in proto_totals:
-            proto_totals[key] += proto_stats[key] * batch_size
-    stats = {key: value / max(total_n, 1) for key, value in proto_totals.items()}
+        loss_totals["task_loss"] += float(task_loss.detach().cpu()) * batch_size
+        for key in proto_stats:
+            loss_totals[key] += proto_stats[key] * batch_size
+    stats = {key: value / max(total_n, 1) for key, value in loss_totals.items()}
     return total_loss / max(total_n, 1), stats
 
 
-def predict_to_frame(meta, features, labels, positions, model, criterion, args, device, epoch):
+def predict_to_frame(meta, features, labels, positions, model, criterion, args, device, epoch, progress_desc="predict"):
     loader = make_loader(
         features,
         labels,
@@ -813,25 +810,38 @@ def predict_to_frame(meta, features, labels, positions, model, criterion, args, 
     uncertainty_rows = []
     loss_total = 0.0
     loss_n = 0
+    loss_totals = {
+        "task_loss": 0.0,
+        "proto_loss": 0.0,
+        "proto_loss_raw": 0.0,
+        "proto_attract_loss": 0.0,
+        "proto_separation_loss": 0.0,
+        "proto_diversity_loss": 0.0,
+    }
 
     with torch.no_grad():
-        for batch_features, batch_labels, batch_rows in maybe_progress(loader, args, "predict"):
+        for batch_features, batch_labels, batch_rows in maybe_progress(loader, args, progress_desc):
             batch_features = batch_features.to(device, non_blocking=True)
             batch_labels = batch_labels.to(device, non_blocking=True)
             evidence, details = model(batch_features, return_details=True)
-            loss = criterion(evidence, batch_labels)
+            task_loss = criterion(evidence, batch_labels)
+            proto_loss, proto_stats = prototype_regularization_loss(model, details, batch_labels, args)
+            loss = task_loss + proto_loss
             probs = details["prob"]
             uncertainty = details["uncertainty"].reshape(-1)
             batch_size = int(batch_labels.shape[0])
             loss_total += float(loss.detach().cpu()) * batch_size
             loss_n += batch_size
+            loss_totals["task_loss"] += float(task_loss.detach().cpu()) * batch_size
+            for key in proto_stats:
+                loss_totals[key] += proto_stats[key] * batch_size
             row_ids.append(batch_rows.numpy())
             evidence_rows.append(evidence.detach().cpu().numpy())
             prob_rows.append(probs.detach().cpu().numpy())
             uncertainty_rows.append(uncertainty.detach().cpu().numpy())
 
     if not row_ids:
-        return meta.iloc[[]].copy(), float("nan")
+        return meta.iloc[[]].copy(), float("nan"), {}
 
     row_ids = np.concatenate(row_ids).astype(int)
     order = np.argsort(row_ids)
@@ -857,7 +867,8 @@ def predict_to_frame(meta, features, labels, positions, model, criterion, args, 
         args.score_agg,
         args.threshold,
     )
-    return pred_df, loss_total / max(loss_n, 1)
+    stats = {key: value / max(loss_n, 1) for key, value in loss_totals.items()}
+    return pred_df, loss_total / max(loss_n, 1), stats
 
 
 def select_eval_metric(metrics_df, eval_split, args, eval_loss):
@@ -1034,8 +1045,20 @@ def run_single(args):
     print(f"[train rows] {len(train_positions)}  [eval rows] {len(eval_positions)} ({eval_split})")
 
     for epoch in range(args.epochs):
-        train_loss, train_proto_stats = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, args)
-        eval_df, eval_loss = predict_to_frame(
+        train_step_loss, train_step_stats = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, args)
+        _, train_loss, train_loss_stats = predict_to_frame(
+            meta,
+            features,
+            labels,
+            train_positions,
+            model,
+            criterion,
+            args,
+            device,
+            epoch,
+            progress_desc="train_eval",
+        )
+        eval_df, eval_loss, eval_loss_stats = predict_to_frame(
             meta,
             features,
             labels,
@@ -1045,6 +1068,7 @@ def run_single(args):
             args,
             device,
             epoch,
+            progress_desc=f"{eval_split}_eval",
         )
         eval_metrics = evaluate_predictions(eval_df, args)
         metric_value, metric_row = select_eval_metric(eval_metrics, eval_split, args, eval_loss)
@@ -1073,6 +1097,7 @@ def run_single(args):
 
         history_row = {
             "epoch": epoch + 1,
+            "train_step_loss": float(train_step_loss),
             "train_loss": float(train_loss),
             "eval_split": eval_split,
             "eval_loss": float(eval_loss),
@@ -1081,7 +1106,13 @@ def run_single(args):
             "best_metric": float(best_metric),
             "improved": bool(improved),
         }
-        history_row.update(train_proto_stats)
+        for key, value in train_step_stats.items():
+            history_row[f"train_step_{key}"] = value
+        for key, value in train_loss_stats.items():
+            history_row[f"train_{key}"] = value
+        for key, value in eval_loss_stats.items():
+            history_row[f"eval_{key}"] = value
+        history_row.update(train_loss_stats)
         for key in ("grain", "auc", "bacc_at_threshold", "sensitivity_at_threshold", "specificity_at_threshold", "pred_pos_at_threshold"):
             if key in metric_row:
                 history_row[f"eval_{key}"] = metric_row[key]
@@ -1092,10 +1123,10 @@ def run_single(args):
         pred_pos_text = metric_row.get("pred_pos_at_threshold", float("nan")) if metric_row else float("nan")
         print(
             f"Epoch {epoch + 1}/{args.epochs} "
-            f"train_loss={train_loss:.4f} {eval_split}_loss={eval_loss:.4f} "
+            f"train_step_loss={train_step_loss:.4f} train_loss={train_loss:.4f} {eval_split}_loss={eval_loss:.4f} "
             f"AUC={auc_text:.4f} bACC@{args.threshold:g}={bacc_text:.4f} "
             f"Pred_Pos@{args.threshold:g}={pred_pos_text} "
-            f"proto={train_proto_stats['proto_loss']:.4f} "
+            f"proto={train_loss_stats.get('proto_loss', float('nan')):.4f} {eval_split}_proto={eval_loss_stats.get('proto_loss', float('nan')):.4f} "
             f"best_{args.best_metric}={best_metric:.4f}"
         )
 
@@ -1123,7 +1154,7 @@ def run_single(args):
     model.load_state_dict(checkpoint["model"])
 
     all_positions = np.arange(len(meta), dtype=int)
-    pred_df, _ = predict_to_frame(
+    pred_df, _, _ = predict_to_frame(
         meta,
         features,
         labels,
@@ -1141,7 +1172,7 @@ def run_single(args):
     manifest_path = output_dir / "proto_edl_manifest.json"
     pred_df.to_csv(pred_path, index=False)
     metrics_df.to_csv(metrics_path, index=False)
-    history_path, loss_curve_path = save_training_history(history, output_dir, "proto_edl")
+    history_path, loss_curve_path = save_training_history(history, output_dir, "proto_edl", args, "EDL")
 
     split_counts = {str(k): int(v) for k, v in meta["proto_edl_split"].value_counts().to_dict().items()}
     label_counts = {str(k): int(v) for k, v in pd.Series(labels).value_counts().to_dict().items()}
